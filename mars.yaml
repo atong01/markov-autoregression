@@ -1,0 +1,24 @@
+name: mars
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    - torch>=2.5
+    - pytorch-lightning>=2.4
+    - torchdiffeq
+    - numpy<2
+    - pandas
+    - mdtraj
+    - scipy
+    - deeptime
+    - dm-tree
+    - fair-esm
+    - biopython
+    - tqdm
+    - wandb
+    - matplotlib
+    - statsmodels
+    - bioemu-benchmarks
