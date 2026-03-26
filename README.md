@@ -6,7 +6,7 @@
   <img src="assets/fig.png" alt="MarS-FM Method Overview" width="100%">
 </p>
 
-Official implementation of [**MarS-FM** (Markov Space Flow Matching)(https://arxiv.org/abs/2509.24779) accepted at ICLR 2026. MarS-FM introduces a new class of generative models—MSM Emulators—that learn to sample transitions across discrete states defined by an underlying Markov State Model (MSM), overcoming the limitations of fixed-lag models.
+Official implementation of [**MarS-FM** (Markov Space Flow Matching)](https://arxiv.org/abs/2509.24779) accepted at ICLR 2026. MarS-FM introduces a new class of generative models—MSM Emulators—that learn to sample transitions across discrete states defined by an underlying Markov State Model (MSM), overcoming the limitations of fixed-lag models.
 
 ---
 
