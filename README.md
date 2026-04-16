@@ -22,6 +22,17 @@ conda activate mars
 1. **Tetrapeptides (4AA)** — Download from [MDGen](https://github.com/bjing2016/mdgen)
 2. **MD-CATH** — Download from [HuggingFace](https://huggingface.co/datasets/compsciencelab/mdCATH)
 
+
+## Pre-trained Checkpoint
+
+We provide pre-trained model weights hosted on Hugging Face. You can use these checkpoints to directly run inference and trajectory generation without needing to train from scratch.
+
+| Dataset | Hugging Face Hub |
+| :--- | :--- |
+| **MD-CATH** | [valencelabs/mars-fm](https://huggingface.co/valencelabs/mars-fm) |
+
+To use a pre-trained model, download the `.ckpt` file from the Hugging Face repository and pass its local path to the `--mars_ckpt` argument in the **Sampling** scripts below.
+
 ## Prepare Dataset Trajectories
 
 Tetrapeptides:
