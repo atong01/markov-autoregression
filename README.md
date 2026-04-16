@@ -29,7 +29,7 @@ We provide pre-trained model weights hosted on Hugging Face. You can use these c
 
 | Dataset | Hugging Face Hub |
 | :--- | :--- |
-| **MD-CATH** | [valencelabs/mars-fm](https://huggingface.co/valencelabs/mars-fm) |
+| **MD-CATH 450** | [valencelabs/mars-fm](https://huggingface.co/valencelabs/mars-fm) |
 
 To use a pre-trained model, download the `.ckpt` file from the Hugging Face repository and pass its local path to the `--mars_ckpt` argument in the **Sampling** scripts below.
 
