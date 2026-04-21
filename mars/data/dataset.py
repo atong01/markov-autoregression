@@ -126,6 +126,9 @@ class MarSDatasetBase(torch.utils.data.Dataset):
 
     @staticmethod
     def _read_trajectory(path):
+        # Check file size first to avoid reading corrupted/empty files
+        if os.path.getsize(path) < 128:  # Minimum valid npy file size
+            raise ValueError(f"File too small, likely corrupted: {path}")
         mm = np.lib.format.open_memmap(path, mode="r")
         try:
             return np.array(mm, copy=True)
@@ -148,7 +151,15 @@ class MarSDataset4AA(MarSDatasetBase):
             if not (os.path.exists(file_path) and os.path.exists(msm_cluster_file)):
                 print(f"Missing file for {name}")
                 continue
-            self.files[name] = self._load_data(file_path, msm_cluster_file)
+            # Check file sizes to skip corrupted files
+            if os.path.getsize(file_path) < 128 or os.path.getsize(msm_cluster_file) < 128:
+                print(f"Corrupted file for {name} (file too small)")
+                continue
+            try:
+                self.files[name] = self._load_data(file_path, msm_cluster_file)
+            except (ValueError, OSError) as e:
+                print(f"Failed to load {name}: {e}")
+                continue
 
         self.valid_names = list(self.files.keys())
 
@@ -185,15 +196,22 @@ class MarSDataset4AA(MarSDatasetBase):
 
     def __getitem__(self, idx):
         idx = idx % len(self.valid_names)
-        name = self.valid_names[idx]
-        data = self.files[name]
+        # Try up to 3 different samples if we hit corrupted files
+        for attempt in range(3):
+            try:
+                name = self.valid_names[(idx + attempt) % len(self.valid_names)]
+                data = self.files[name]
 
-        arr = self._read_trajectory(data["arr_path"])
-        x_t, x_t_plus_tau = self._sample_clusters(
-            arr, data["clusters"], data["probabilities"],
-            data["cluster_members"], data["unique_clusters"],
-        )
-        return self._process_output(x_t, x_t_plus_tau, name, name)
+                arr = self._read_trajectory(data["arr_path"])
+                x_t, x_t_plus_tau = self._sample_clusters(
+                    arr, data["clusters"], data["probabilities"],
+                    data["cluster_members"], data["unique_clusters"],
+                )
+                return self._process_output(x_t, x_t_plus_tau, name, name)
+            except (ValueError, OSError) as e:
+                if attempt == 2:
+                    raise RuntimeError(f"Failed to load data after 3 attempts: {e}")
+                continue
 
 
 # ---------------------------------------------------------------------------
@@ -257,13 +275,24 @@ class MarSDatasetMDCath(MarSDatasetBase):
 
     @staticmethod
     def _validate_files(file_paths):
-        return all(os.path.exists(fp) for fp in file_paths)
+        for fp in file_paths:
+            if not os.path.exists(fp):
+                return False
+            # Check file size - empty/corrupted files cause EOF errors
+            if os.path.getsize(fp) < 128:
+                return False
+        return True
 
     def _load_arrays_and_clusters(self, file_paths, msm_cluster_files):
         clusters_list = []
         for cf, fp in zip(msm_cluster_files, file_paths):
-            if os.path.exists(cf):
-                clusters_list.append(np.load(cf, mmap_mode=None))
+            if os.path.exists(cf) and os.path.getsize(cf) >= 128:
+                try:
+                    clusters_list.append(np.load(cf, mmap_mode=None))
+                except (ValueError, OSError) as e:
+                    print(f"Warning: Failed to load cluster file {cf}: {e}")
+                    length = self._read_trajectory(fp).shape[0]
+                    clusters_list.append(np.zeros(length, dtype=np.int32))
             else:
                 length = self._read_trajectory(fp).shape[0]
                 clusters_list.append(np.zeros(length, dtype=np.int32))
@@ -295,20 +324,28 @@ class MarSDatasetMDCath(MarSDatasetBase):
         return probabilities, np.unique(all_clusters)
 
     def __getitem__(self, idx):
-        name = self.valid_names[idx % len(self.valid_names)]
-        seqres = self.df.seqres[name]
-        full_name = f"{name}_{self.args.data_temperature}"
-        data = self.files[name]
+        idx = idx % len(self.valid_names)
+        # Try up to 3 different samples if we hit corrupted files
+        for attempt in range(3):
+            try:
+                name = self.valid_names[(idx + attempt) % len(self.valid_names)]
+                seqres = self.df.seqres[name]
+                full_name = f"{name}_{self.args.data_temperature}"
+                data = self.files[name]
 
-        arr, clusters, probabilities, cluster_members, unique_clusters = (
-            self._merge_replicas(data)
-        )
-        x_t, x_t_plus_tau = self._sample_clusters(
-            arr, clusters, probabilities, cluster_members, unique_clusters
-        )
-        return self._crop_pad_output(
-            self._process_output(x_t, x_t_plus_tau, seqres, full_name)
-        )
+                arr, clusters, probabilities, cluster_members, unique_clusters = (
+                    self._merge_replicas(data)
+                )
+                x_t, x_t_plus_tau = self._sample_clusters(
+                    arr, clusters, probabilities, cluster_members, unique_clusters
+                )
+                return self._crop_pad_output(
+                    self._process_output(x_t, x_t_plus_tau, seqres, full_name)
+                )
+            except (ValueError, OSError) as e:
+                if attempt == 2:
+                    raise RuntimeError(f"Failed to load data after 3 attempts: {e}")
+                continue
 
     def _merge_replicas(self, data):
         arr = np.concatenate(
