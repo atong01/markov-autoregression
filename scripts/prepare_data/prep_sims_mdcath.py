@@ -2,9 +2,17 @@
 
 import argparse
 import os
+import tempfile
 from functools import partial
 from multiprocessing import Pool
 
+# Limit threads per process to prevent oversubscription
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import h5py
 import mdtraj
 import numpy as np
 import tqdm
@@ -37,27 +45,66 @@ def traj_to_atom14(traj):
 
 
 def process_domain(name, sim_dir, outdir):
-    for temp in TEMPERATURES:
-        for i in range(NUM_REPLICAS):
-            out_path = f"{outdir}/{name}_{temp}_{i}.npy"
-            if os.path.exists(out_path):
+    h5_path = os.path.join(sim_dir, f"mdcath_dataset_{name}.h5")
+    if not os.path.exists(h5_path):
+        print(f"H5 file not found: {h5_path}")
+        return
+
+    with h5py.File(h5_path, "r") as f:
+        domain_group = f[name]
+
+        # Get topology from pdbProteinAtoms (matches coords atom count)
+        pdb_str = domain_group["pdbProteinAtoms"][()].decode("utf-8")
+
+        # Write to temp file for mdtraj
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as tmp:
+            tmp.write(pdb_str)
+            tmp_path = tmp.name
+
+        try:
+            topology = mdtraj.load_pdb(tmp_path).topology
+        finally:
+            os.unlink(tmp_path)
+
+        for temp in TEMPERATURES:
+            temp_str = str(temp)
+            if temp_str not in domain_group:
                 continue
-            traj = mdtraj.load(
-                f"{sim_dir}/trajectory/{name}_{temp}_{i}.xtc",
-                top=f"{sim_dir}/topology/{name}.pdb",
-            )
-            traj.atom_slice(
-                [a.index for a in traj.top.atoms if a.element.symbol != "H"], True
-            )
-            traj.superpose(traj)
-            arr = traj_to_atom14(traj)
-            np.save(out_path, arr)
+
+            for i in range(NUM_REPLICAS):
+                out_path = f"{outdir}/{name}_{temp}_{i}.npy"
+                if os.path.exists(out_path):
+                    continue
+
+                replica_str = str(i)
+                if replica_str not in domain_group[temp_str]:
+                    continue
+
+                # Load coordinates (Angstrom -> nm for mdtraj)
+                coords = np.array(domain_group[f"{temp_str}/{replica_str}/coords"]) / 10.0
+
+                # Create trajectory
+                traj = mdtraj.Trajectory(coords, topology)
+
+                # Remove hydrogens and superpose
+                traj.atom_slice(
+                    [a.index for a in traj.top.atoms if a.element.symbol != "H"], True
+                )
+                traj.superpose(traj)
+
+                arr = traj_to_atom14(traj)
+                np.save(out_path, arr)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--split", type=str, default="splits/mdCATH.txt")
-    parser.add_argument("--sim_dir", type=str, required=True)
+    parser.add_argument(
+        "--sim_dir",
+        type=str,
+        required=True,
+        help="Directory containing mdcath_dataset_*.h5 files",
+    )
     parser.add_argument("--outdir", type=str, required=True)
     parser.add_argument("--num_workers", type=int, default=1)
     args = parser.parse_args()
