@@ -54,11 +54,34 @@ def parse_train_args():
     loop.add_argument("--val_batches", type=int, default=None)
     loop.add_argument("--val_repeat", type=int, default=1)
 
+    # ---- Autoregressive ----
+    ar = parser.add_argument_group("Autoregressive")
+    ar.add_argument("--ar", action="store_true",
+                    help="Use the autoregressive model instead of flow matching.")
+    ar.add_argument("--num_bins", type=int, default=8192)
+    ar.add_argument("--discretize_min", type=float, default=-5.0)
+    ar.add_argument("--discretize_max", type=float, default=5.0)
+    ar.add_argument("--ar_temperature", type=float, default=1.0)
+    ar.add_argument("--ar_top_k", type=int, default=None)
+    ar.add_argument("--ar_top_p", type=float, default=None)
+    ar.add_argument("--label_smoothing", type=float, default=0.0)
+    ar.add_argument("--use_empirical_offsets", action="store_true")
+    ar.add_argument("--auto_discretize_range", action="store_true",
+                    help="Calibrate per-channel discretization bounds from the "
+                         "training data as μ ± k·σ before training starts.")
+    ar.add_argument("--discretize_std_k", type=float, default=4.0,
+                    help="Std-multiplier for auto-calibrated bounds (default 4σ).")
+    ar.add_argument("--calibration_batches", type=int, default=32,
+                    help="Number of training batches sampled during calibration.")
+    ar.add_argument("--bf16", action="store_true",
+                    help="Use bf16-mixed precision (recommended for AR training).")
+
     # ---- Logging ----
     log = parser.add_argument_group("Logging")
     log.add_argument("--ckpt_freq", type=int, default=1)
     log.add_argument("--wandb", action="store_true")
     log.add_argument("--run_name", type=str, default="default")
+    log.add_argument("--wandb_name", type=str, default=None)
     log.add_argument("--model_dir", type=str, default="workdir")
 
     args = parser.parse_args()

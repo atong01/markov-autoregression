@@ -22,9 +22,9 @@ import torch
 import tqdm
 from scipy.stats import gaussian_kde
 
-import mars.analysis
-from mars.vendored.openfold.residue_constants import restype_order
-from mars.utils import atom14_to_pdb, set_seed
+import markov_autoregression.analysis
+from markov_autoregression.vendored.openfold.residue_constants import restype_order
+from markov_autoregression.utils import atom14_to_pdb, set_seed
 
 from bioemu_benchmarks.eval.folding_free_energies.fraction_native_contacts import (
     FNCSettings,

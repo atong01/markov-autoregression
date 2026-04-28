@@ -17,7 +17,7 @@ import mdtraj
 import numpy as np
 import tqdm
 
-from mars.vendored.openfold import residue_constants as rc
+from markov_autoregression.vendored.openfold import residue_constants as rc
 
 TEMPERATURES = [320, 348, 379, 413, 450]
 NUM_REPLICAS = 5

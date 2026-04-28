@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import tqdm
 
-from mars.vendored.openfold import residue_constants as rc
+from markov_autoregression.vendored.openfold import residue_constants as rc
 
 
 def traj_to_atom14(traj):

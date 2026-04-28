@@ -8,7 +8,7 @@ from multiprocessing import Pool
 import numpy as np
 import tqdm
 
-import mars.analysis
+import markov_autoregression.analysis
 
 
 def _msm_cluster_path(data_dir, name, n_clusters):

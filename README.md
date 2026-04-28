@@ -146,7 +146,7 @@ python -m scripts.analysis.analyze_mdcath \
 ## Repository Structure
 
 ```
-mars/
+markov_autoregression/
 ├── model/
 │   ├── model.py              # MarS neural network (DiT + IPA)
 │   └── module.py             # PyTorch Lightning training & inference modules

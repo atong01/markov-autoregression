@@ -11,6 +11,20 @@ from ..vendored.openfold.residue_constants import restype_order
 from ..vendored.openfold.rigid_utils import Rigid
 
 
+def _is_rank_0() -> bool:
+    """True on rank 0 of a DDP run, or always True if not under DDP."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    # Pre-DDP-init code path (datasets are built before trainer.fit on each
+    # rank). Fall back to SLURM env so we still avoid 4× log spam.
+    return int(os.environ.get("SLURM_PROCID", "0")) == 0
+
+
+def _rprint(*a, **kw):
+    if _is_rank_0():
+        print(*a, **kw)
+
+
 class MarSDatasetBase(torch.utils.data.Dataset):
     """Shared logic for MSM-guided trajectory sampling."""
 
@@ -149,16 +163,16 @@ class MarSDataset4AA(MarSDatasetBase):
         for name in self.df.index:
             file_path, msm_cluster_file = self._construct_file_paths(name)
             if not (os.path.exists(file_path) and os.path.exists(msm_cluster_file)):
-                print(f"Missing file for {name}")
+                _rprint(f"Missing file for {name}")
                 continue
             # Check file sizes to skip corrupted files
             if os.path.getsize(file_path) < 128 or os.path.getsize(msm_cluster_file) < 128:
-                print(f"Corrupted file for {name} (file too small)")
+                _rprint(f"Corrupted file for {name} (file too small)")
                 continue
             try:
                 self.files[name] = self._load_data(file_path, msm_cluster_file)
             except (ValueError, OSError) as e:
-                print(f"Failed to load {name}: {e}")
+                _rprint(f"Failed to load {name}: {e}")
                 continue
 
         self.valid_names = list(self.files.keys())
@@ -228,7 +242,7 @@ class MarSDatasetMDCath(MarSDatasetBase):
             file_paths, msm_cluster_files = self._construct_file_paths(name)
 
             if not self._validate_files(file_paths):
-                print(f"Missing trajectory file(s) for {name}. Skipping...")
+                _rprint(f"Missing trajectory file(s) for {name}. Skipping...")
                 continue
 
             arr_list, clusters_list = self._load_arrays_and_clusters(
@@ -238,7 +252,7 @@ class MarSDatasetMDCath(MarSDatasetBase):
                 arr_list, clusters_list
             )
             if len(arr_list) == 0:
-                print(f"Protein {name} has only one state. Skipping...")
+                _rprint(f"Protein {name} has only one state. Skipping...")
                 num_single_state += 1
                 continue
 
@@ -263,7 +277,7 @@ class MarSDatasetMDCath(MarSDatasetBase):
                 num_single_state += 1
 
         self.valid_names = list(self.files.keys())
-        print("Number of proteins with only one state:", num_single_state)
+        _rprint("Number of proteins with only one state:", num_single_state)
 
     def _construct_file_paths(self, name):
         base = self.args.data_dir
@@ -290,7 +304,7 @@ class MarSDatasetMDCath(MarSDatasetBase):
                 try:
                     clusters_list.append(np.load(cf, mmap_mode=None))
                 except (ValueError, OSError) as e:
-                    print(f"Warning: Failed to load cluster file {cf}: {e}")
+                    _rprint(f"Warning: Failed to load cluster file {cf}: {e}")
                     length = self._read_trajectory(fp).shape[0]
                     clusters_list.append(np.zeros(length, dtype=np.int32))
             else:

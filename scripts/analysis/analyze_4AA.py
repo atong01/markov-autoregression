@@ -20,8 +20,8 @@ import tqdm
 from scipy.spatial.distance import jensenshannon
 from statsmodels.tsa.stattools import acovf
 
-import mars.analysis
-from mars.utils import set_seed
+import markov_autoregression.analysis
+from markov_autoregression.utils import set_seed
 
 # ---------------------------------------------------------------------------
 # CLI

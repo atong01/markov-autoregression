@@ -10,11 +10,12 @@ import torch
 torch.serialization.add_safe_globals([argparse.Namespace])
 from tqdm import trange
 
-from mars.data.geometry import atom14_to_frames, atom14_to_atom37, atom37_to_torsions
-from mars.vendored.openfold.residue_constants import restype_order
-from mars.vendored.openfold.tensor_utils import tensor_tree_map
-from mars.utils import atom14_to_pdb, set_seed
-from mars.model.module import MDGenModule, MarSModule
+from markov_autoregression.data.geometry import atom14_to_frames, atom14_to_atom37, atom37_to_torsions
+from markov_autoregression.vendored.openfold.residue_constants import restype_order
+from markov_autoregression.vendored.openfold.tensor_utils import tensor_tree_map
+from markov_autoregression.utils import atom14_to_pdb, set_seed
+from markov_autoregression.model.module import MDGenModule, MarSModule
+from markov_autoregression.model.autoregressive_model import MarSARModule
 
 
 def _repeat_batch(batch, n):
@@ -164,7 +165,8 @@ def generate(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model_mars = MarSModule.load_from_checkpoint(args.mars_ckpt)
+    ModelClass = MarSARModule if getattr(args, "ar", False) else MarSModule
+    model_mars = ModelClass.load_from_checkpoint(args.mars_ckpt)
     model_mars.eval().to(device)
 
     model_mdgen = None
@@ -244,7 +246,12 @@ if __name__ == "__main__":
         help="Max trajectories fed to MarS in a single GPU call.",
     )
     parser.add_argument("--num_steps", type=int, default=50,
-        help="Number of ODE integration steps for sampling.",
+        help="Number of ODE integration steps for sampling (flow-matching only; "
+             "ignored when --ar is set).",
+    )
+    parser.add_argument("--ar", action="store_true",
+        help="Load checkpoint as MarSARModule (autoregressive model). "
+             "Otherwise loads MarSModule (flow-matching).",
     )
 
     args = parser.parse_args()
