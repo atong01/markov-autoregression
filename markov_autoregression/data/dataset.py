@@ -36,7 +36,6 @@ class MarSDatasetBase(torch.utils.data.Dataset):
         self.num_transitions_per_traj = args.samples_per_cluster * args.clusters_per_batch
         self.num_samples_per_cluster = args.samples_per_cluster
         self.num_clusters_to_sample = args.clusters_per_batch
-        self.backbone = args.backbone
         self.euclidean = args.euclidean
         self.ca_only = args.euclidean and args.ca_only
         self.translate = translate

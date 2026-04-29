@@ -20,7 +20,6 @@ def parse_train_args():
     data.add_argument("--crop", type=int, default=256)
     data.add_argument("--euclidean", action="store_true")
     data.add_argument("--ca_only", action="store_true")
-    data.add_argument("--backbone", action="store_true")
     data.add_argument("--s_translation", type=float, default=1.0)
 
     # ---- MSM / clustering ----
