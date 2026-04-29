@@ -73,7 +73,11 @@ class MarSARModule(BaseModule):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
         self.args = args
-        self.latent_dim = 21
+        if getattr(args, "euclidean", False):
+            n_atoms = 1 if getattr(args, "ca_only", False) else 4
+            self.latent_dim = n_atoms * 3
+        else:
+            self.latent_dim = 21
 
         self.model = CausalARModel(args, self.latent_dim)
         self.discretize = DiscretizeTransform(
@@ -92,6 +96,24 @@ class MarSARModule(BaseModule):
 
     @staticmethod
     def _pair_with_tau(batch):
+        if "coords" in batch:
+            B, T = batch["coords"].shape[:2]
+            rest = batch["coords"].shape[2:]
+            batch["coords"] = torch.stack(
+                [
+                    batch["coords"].reshape(B * T, *rest),
+                    batch["coords_plus_tau"].reshape(B * T, *rest),
+                ],
+                dim=1,
+            )
+            for key in ["mask", "seqres"]:
+                batch[key] = (
+                    batch[key]
+                    .unsqueeze(1)
+                    .expand(B, T, *batch[key].shape[1:])
+                    .reshape(B * T, *batch[key].shape[1:])
+                )
+            return
         for key in ["trans", "rots", "torsions"]:
             B, T = batch[key].shape[:2]
             rest = batch[key].shape[2:]
@@ -110,13 +132,35 @@ class MarSARModule(BaseModule):
                 .reshape(B * T, *batch[key].shape[1:])
             )
 
+    # ----- Euclidean overrides -----------------------------------------------
+
+    def _build_rigids(self, batch):
+        if "coords" in batch:
+            return None
+        else:
+            return super()._build_rigids(batch)
+
+    def _build_latents(self, batch, rigids):
+        if "coords" not in batch:
+            return super()._build_latents(batch, rigids)
+        coords = batch["coords"]
+        Bt, two, L = coords.shape[:3]
+        return coords.reshape(Bt, two, L, self.latent_dim)
+
+    def _decode_samples(self, samples, rigids, seqres):
+        if not getattr(self.args, "euclidean", False):
+            return super()._decode_samples(samples, rigids, seqres)
+        Bt, T, L, D = samples.shape
+        coords = samples.reshape(Bt, T, L, D // 3, 3)
+        return coords, seqres[:, None].expand(Bt, T, L)
+
     # ----- Encoding building blocks -----------------------------------------
 
     def _build_encodings(self, batch, rigids, x_cond):
         return {
             "aatype": batch["seqres"].long(),
             "x_cond": x_cond,
-            "frames": rigids[:, 0],
+            "frames": rigids[:, 0] if rigids is not None else None,
             "mask": batch["mask"].float(),
         }
 
@@ -358,7 +402,7 @@ class MarSARModule(BaseModule):
     @torch.no_grad()
     def inference(self, batch, num_steps: Optional[int] = None):
         """Autoregressive sample of x_{t+τ} given x_t. num_steps is unused."""
-        if "trans_plus_tau" in batch:
+        if "trans_plus_tau" in batch or "coords_plus_tau" in batch:
             batch = dict(batch)
             self._pair_with_tau(batch)
         rigids = self._build_rigids(batch)
@@ -382,4 +426,4 @@ class MarSARModule(BaseModule):
 
         cont = self._undiscretize(generated, L)         # (Bt, L, D)
         samples = cont.unsqueeze(1)                     # (Bt, 1, L, 21)
-        return self._decode_samples(samples, rigids[:, 0:1], seqres)
+        return self._decode_samples(samples, rigids[:, 0:1] if rigids is not None else None, seqres)
