@@ -66,7 +66,7 @@ def _build_dataloaders(args):
     else:
         from markov_autoregression.data.dataset import MarSDataset4AA as MarSDataset
 
-    trainset = MarSDataset(args, split=args.train_split)
+    trainset = MarSDataset(args, split=args.train_split, translate=True)
     valset = MarSDataset(args, split=args.val_split, repeat=args.val_repeat)
 
     train_loader = torch.utils.data.DataLoader(

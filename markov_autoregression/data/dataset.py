@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import tqdm
 
-from .geometry import atom37_to_torsions, atom14_to_atom37, atom14_to_frames
+from .geometry import atom37_to_torsions, atom14_to_atom37, atom14_to_frames, atom14_to_backbone, atom14_to_ca, center_dense_coords, geometric_augmentation
 from ..vendored.openfold.residue_constants import restype_order
 from ..vendored.openfold.rigid_utils import Rigid
 
@@ -28,7 +28,7 @@ def _rprint(*a, **kw):
 class MarSDatasetBase(torch.utils.data.Dataset):
     """Shared logic for MSM-guided trajectory sampling."""
 
-    def __init__(self, args, split, repeat=1):
+    def __init__(self, args, split, repeat=1, translate=False):
         super().__init__()
         self.df = pd.read_csv(split, index_col="name")
         self.args = args
@@ -36,6 +36,10 @@ class MarSDatasetBase(torch.utils.data.Dataset):
         self.num_transitions_per_traj = args.samples_per_cluster * args.clusters_per_batch
         self.num_samples_per_cluster = args.samples_per_cluster
         self.num_clusters_to_sample = args.clusters_per_batch
+        self.backbone = args.backbone
+        self.euclidean = args.euclidean
+        self.ca_only = args.euclidean and args.ca_only
+        self.translate = translate
         self.files = {}
 
     def __len__(self):
@@ -105,10 +109,34 @@ class MarSDatasetBase(torch.utils.data.Dataset):
         return sampled
 
     def _process_output(self, x_t, x_t_plus_tau, seqres_str, name):
-        """Convert raw atom14 arrays to frames, torsions, and masks."""
+        """Convert raw atom14 arrays to (frames, torsions, and masks) or (coords and masks)"""
+        seqres = np.array([restype_order[c] for c in seqres_str])
+
+        if self.euclidean:
+            if self.ca_only:
+                coords = atom14_to_ca(torch.from_numpy(x_t))
+                coords_plus_tau = atom14_to_ca(torch.from_numpy(x_t_plus_tau))
+            else:
+                coords = atom14_to_backbone(torch.from_numpy(x_t))
+                coords_plus_tau = atom14_to_backbone(torch.from_numpy(x_t_plus_tau))
+            
+            coords = center_dense_coords(coords)
+            coords_plus_tau = center_dense_coords(coords_plus_tau)
+            coords, coords_plus_tau = geometric_augmentation(coords, coords_plus_tau, s_trans=self.args.s_translation, translate=self.translate)
+            
+            L = coords.shape[1]
+            mask = np.ones(L, dtype=np.float32)
+
+            return {
+                "name": name,
+                "coords": coords,
+                "coords_plus_tau": coords_plus_tau,
+                "seqres": seqres,
+                "mask": mask,
+            }
+        
         frames = atom14_to_frames(torch.from_numpy(x_t))
         frames_plus_tau = atom14_to_frames(torch.from_numpy(x_t_plus_tau))
-        seqres = np.array([restype_order[c] for c in seqres_str])
 
         aatype = torch.from_numpy(seqres)[None].expand(
             self.num_transitions_per_traj, -1
@@ -157,8 +185,8 @@ class MarSDatasetBase(torch.utils.data.Dataset):
 
 
 class MarSDataset4AA(MarSDatasetBase):
-    def __init__(self, args, split, repeat=1):
-        super().__init__(args, split, repeat)
+    def __init__(self, args, split, repeat=1, translate=False):
+        super().__init__(args, split, repeat, translate=translate)
 
         for name in self.df.index:
             file_path, msm_cluster_file = self._construct_file_paths(name)
@@ -181,10 +209,7 @@ class MarSDataset4AA(MarSDatasetBase):
         base = self.args.data_dir
         n = self.args.msm_num_states
         file_path = f"{base}/{name}.npy"
-        msm_cluster_file = (
-            f"{base}/{name}_msm_cluster.npy" if n == 10
-            else f"{base}/{name}_msm_cluster_{n}.npy"
-        )
+        msm_cluster_file = f"{base}/{name}_msm_cluster_{n}.npy"
         return file_path, msm_cluster_file
 
     def _load_data(self, file_path, msm_cluster_file):
@@ -234,8 +259,8 @@ class MarSDataset4AA(MarSDatasetBase):
 
 
 class MarSDatasetMDCath(MarSDatasetBase):
-    def __init__(self, args, split, repeat=1):
-        super().__init__(args, split, repeat)
+    def __init__(self, args, split, repeat=1, translate=False):
+        super().__init__(args, split, repeat, translate=translate)
         num_single_state = 0
 
         for name in tqdm.tqdm(self.df.index):
@@ -395,35 +420,48 @@ class MarSDatasetMDCath(MarSDatasetBase):
         if L > crop:
             s = np.random.randint(0, L - crop + 1)
             e = s + crop
-            out["torsions"] = out["torsions"][:, s:e]
-            out["torsions_plus_tau"] = out["torsions_plus_tau"][:, s:e]
-            out["torsion_mask"] = out["torsion_mask"][s:e]
-            out["trans"] = out["trans"][:, s:e]
-            out["trans_plus_tau"] = out["trans_plus_tau"][:, s:e]
-            out["rots"] = out["rots"][:, s:e]
-            out["rots_plus_tau"] = out["rots_plus_tau"][:, s:e]
+            if self.euclidean:
+                out["coords"] = out["coords"][:, s:e]
+                out["coords_plus_tau"] = out["coords_plus_tau"][:, s:e]
+            else:
+                out["torsions"] = out["torsions"][:, s:e]
+                out["torsions_plus_tau"] = out["torsions_plus_tau"][:, s:e]
+                out["torsion_mask"] = out["torsion_mask"][s:e]
+                out["trans"] = out["trans"][:, s:e]
+                out["trans_plus_tau"] = out["trans_plus_tau"][:, s:e]
+                out["rots"] = out["rots"][:, s:e]
+                out["rots_plus_tau"] = out["rots_plus_tau"][:, s:e]
             out["seqres"] = out["seqres"][s:e]
             out["mask"] = out["mask"][s:e]
 
         elif L < crop:
             pad = crop - L
             n = self.num_transitions_per_traj
-            pad_rigid = Rigid.identity((n, pad), requires_grad=False, fmt="rot_mat")
 
-            out["trans"] = torch.cat([out["trans"], pad_rigid._trans], 1)
-            out["trans_plus_tau"] = torch.cat([out["trans_plus_tau"], pad_rigid._trans], 1)
-            out["rots"] = torch.cat([out["rots"], pad_rigid._rots._rot_mats], 1)
-            out["rots_plus_tau"] = torch.cat([out["rots_plus_tau"], pad_rigid._rots._rot_mats], 1)
             out["mask"] = np.concatenate([out["mask"], np.zeros(pad, dtype=np.float32)])
             out["seqres"] = np.concatenate([out["seqres"], np.zeros(pad, dtype=int)])
-            out["torsions"] = torch.cat(
-                [out["torsions"], torch.zeros((n, pad, 7, 2), dtype=torch.float32)], 1
-            )
-            out["torsions_plus_tau"] = torch.cat(
-                [out["torsions_plus_tau"], torch.zeros((n, pad, 7, 2), dtype=torch.float32)], 1
-            )
-            out["torsion_mask"] = torch.cat(
-                [out["torsion_mask"], torch.zeros((pad, 7), dtype=torch.float32)]
-            )
+
+            if self.euclidean:
+                n_atoms = out["coords"].shape[-2]
+                pad_coords = torch.zeros((n, pad, n_atoms, 3), dtype=torch.float32)
+                out["coords"] = torch.cat([out["coords"], pad_coords], dim=1)
+                out["coords_plus_tau"] = torch.cat([out["coords_plus_tau"], pad_coords], dim=1)
+
+            else:
+                pad_rigid = Rigid.identity((n, pad), requires_grad=False, fmt="rot_mat")
+
+                out["trans"] = torch.cat([out["trans"], pad_rigid._trans], 1)
+                out["trans_plus_tau"] = torch.cat([out["trans_plus_tau"], pad_rigid._trans], 1)
+                out["rots"] = torch.cat([out["rots"], pad_rigid._rots._rot_mats], 1)
+                out["rots_plus_tau"] = torch.cat([out["rots_plus_tau"], pad_rigid._rots._rot_mats], 1)
+                out["torsions"] = torch.cat(
+                    [out["torsions"], torch.zeros((n, pad, 7, 2), dtype=torch.float32)], 1
+                )
+                out["torsions_plus_tau"] = torch.cat(
+                    [out["torsions_plus_tau"], torch.zeros((n, pad, 7, 2), dtype=torch.float32)], 1
+                )
+                out["torsion_mask"] = torch.cat(
+                    [out["torsion_mask"], torch.zeros((pad, 7), dtype=torch.float32)]
+                )
 
         return out

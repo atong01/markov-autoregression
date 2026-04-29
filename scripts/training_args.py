@@ -18,6 +18,10 @@ def parse_train_args():
     data.add_argument("--mdcath", action="store_true")
     data.add_argument("--data_temperature", type=int, default=320)
     data.add_argument("--crop", type=int, default=256)
+    data.add_argument("--euclidean", action="store_true")
+    data.add_argument("--ca_only", action="store_true")
+    data.add_argument("--backbone", action="store_true")
+    data.add_argument("--s_translation", type=float, default=1.0)
 
     # ---- MSM / clustering ----
     msm = parser.add_argument_group("MSM clustering")

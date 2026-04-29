@@ -2,6 +2,7 @@
 
 import torch
 import numpy as np
+from scipy.spatial.transform import Rotation as ScipyRotation
 
 from ..vendored.openfold.rigid_utils import Rigid, Rotation
 from ..vendored.openfold import residue_constants as rc
@@ -170,6 +171,44 @@ def atom14_to_frames(atom14):
     rots[:, :, 2, 2] = -1
     return prot_frames.compose(Rigid(Rotation(rot_mats=rots), None))
 
+
+def atom14_to_backbone(atom14):
+    atom_idx = [rc.atom_order['N'], rc.atom_order['CA'], rc.atom_order['C'], rc.atom_order['O']]
+    return atom14[:, :, atom_idx]
+
+def atom14_to_ca(atom14):
+    return atom14[:, :, [rc.atom_order['CA']]]
+
+def center_dense_coords(coords):
+    """Center coordinates of each item in batch [B, L, n_atoms, 3] with only valid atoms"""
+    B = coords.shape[0]
+    centroid = coords.reshape(B, -1, 3).mean(dim=1)  # [B, 3]
+    return coords - centroid.reshape(B, 1, 1, 3)
+
+def uniform_random_rotation(B: int = 1) -> torch.Tensor:
+    """Generate B uniformly random rotation matrices via scipy."""
+    return torch.from_numpy(ScipyRotation.random(num=B).as_matrix()).float()  # (B, 3, 3)
+
+def geometric_augmentation(coords, coords_plus_tau, s_trans: float = 1.0, translate: bool = True):
+    """Apply the same random rotation and translation to a pair of coord tensors.
+
+    Both inputs have shape (B, L, n_atoms, 3) and must be centred before calling.
+    Applying identical transforms to x_t and x_{t+tau} preserves the transition.
+    """
+    B = coords.shape[0]
+    rot = uniform_random_rotation(B)          # (B, 3, 3)
+
+    if translate:
+        trans = s_trans * torch.randn(B, 1, 3)   # (B, 1, 3)
+    else:
+        trans = torch.zeros(B, 1, 3)
+
+    def apply(x):
+        flat = x.reshape(B, -1, 3)                            # (B, L*n_atoms, 3)
+        return (flat @ rot.transpose(-1, -2) + trans).reshape(*x.shape)
+
+    return apply(coords), apply(coords_plus_tau)
+    
 
 def frames_and_literature_positions_to_atom14_pos(
     r: Rigid,

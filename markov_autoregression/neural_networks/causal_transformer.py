@@ -75,16 +75,18 @@ def _sincos_pos(seq_len: int, dim: int, device) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Bidirectional structure encoder (per-residue context)
+# Bidirectional structure encoders (per-residue context)
 # ---------------------------------------------------------------------------
 
 
 class StructureEncoderLayer(nn.Module):
     def __init__(self, embed_dim, ffn_dim, num_heads, ipa_args,
-                 use_rms_norm=True, use_swiglu=True):
+                 use_rms_norm=True, use_swiglu=True, use_ipa=True):
         super().__init__()
-        self.ipa_norm = _norm(use_rms_norm, embed_dim)
-        self.ipa = InvariantPointAttention(**ipa_args)
+        self.use_ipa = use_ipa
+        if use_ipa:
+            self.ipa_norm = _norm(use_rms_norm, embed_dim)
+            self.ipa = InvariantPointAttention(**ipa_args)
         self.attn_norm = _norm(use_rms_norm, embed_dim)
         self.attn = AttentionWithRoPE(
             embed_dim, num_heads, add_bias_kv=True, use_rotary_embeddings=True,
@@ -93,7 +95,8 @@ class StructureEncoderLayer(nn.Module):
         self.ffn = _make_ffn(embed_dim, ffn_dim, use_swiglu=use_swiglu)
 
     def forward(self, x, mask, frames):
-        x = x + self.ipa(self.ipa_norm(x), frames, frame_mask=mask)
+        if self.use_ipa:
+            x = x + self.ipa(self.ipa_norm(x), frames, frame_mask=mask)
         x = x + self.attn(self.attn_norm(x), mask=mask)
         x = x + self.ffn(self.ffn_norm(x))
         return x
@@ -101,7 +104,7 @@ class StructureEncoderLayer(nn.Module):
 
 class StructureEncoder(nn.Module):
     def __init__(self, embed_dim, num_layers, num_heads, ipa_args, latent_dim,
-                 use_rms_norm=True, use_swiglu=True):
+                 use_rms_norm=True, use_swiglu=True, use_ipa=True):
         super().__init__()
         self.aatype_emb = nn.Embedding(21, embed_dim)
         self.cond_proj = nn.Linear(latent_dim, embed_dim)
@@ -109,6 +112,7 @@ class StructureEncoder(nn.Module):
             StructureEncoderLayer(
                 embed_dim, 4 * embed_dim, num_heads, ipa_args,
                 use_rms_norm=use_rms_norm, use_swiglu=use_swiglu,
+                use_ipa=use_ipa,
             )
             for _ in range(num_layers)
         ])
@@ -252,16 +256,13 @@ class CausalDecoderLayer(nn.Module):
 
 
 class CausalARModel(nn.Module):
-    """Per-residue 21-channel autoregressive model.
+    """Per-residue autoregressive model.
 
-    Sequence length per example = num_residues * NUM_CHANNELS, residue-major.
+    Sequence length per example = num_residues * latent_dim, residue-major.
     """
-
-    NUM_CHANNELS = 21
-
     def __init__(self, args, latent_dim: int = 21):
         super().__init__()
-        assert latent_dim == self.NUM_CHANNELS
+        self.latent_dim = latent_dim
         self.args = args
         self.embed_dim = args.embed_dim
         self.num_bins = args.num_bins
@@ -271,14 +272,16 @@ class CausalARModel(nn.Module):
         use_cross_attn = getattr(args, "use_cross_attention", True)
         cross_qk_norm = getattr(args, "cross_attn_qk_norm", True)
         cross_gate = getattr(args, "cross_attn_gate", True)
+        use_ipa = not getattr(args, "euclidean", False)
 
         self.use_cross_attn = use_cross_attn
+        self.use_ipa = use_ipa
 
         # Token embedding: index 0 = START; indices 1..num_bins = bin labels 0..num_bins-1.
         self.token_emb = nn.Embedding(self.num_bins + 1, self.embed_dim)
-        self.channel_emb = nn.Embedding(self.NUM_CHANNELS, self.embed_dim)
+        self.channel_emb = nn.Embedding(self.latent_dim, self.embed_dim)
 
-        max_seq = args.crop * self.NUM_CHANNELS
+        max_seq = args.crop * self.latent_dim
         self.register_buffer(
             "seq_pos_embed",
             _sincos_pos(max_seq, self.embed_dim, "cpu"),
@@ -301,6 +304,7 @@ class CausalARModel(nn.Module):
             latent_dim=latent_dim,
             use_rms_norm=use_rms_norm,
             use_swiglu=use_swiglu,
+            use_ipa=use_ipa,
         )
 
         self.decoder = nn.ModuleList([
@@ -332,11 +336,12 @@ class CausalARModel(nn.Module):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
         self.apply(_basic)
-
-        # IPA stability: zero output projection so the residual block starts as identity.
-        for layer in self.encoder.layers:
-            nn.init.zeros_(layer.ipa.linear_out.weight)
-            nn.init.zeros_(layer.ipa.linear_out.bias)
+        
+        if self.use_ipa:
+            # IPA stability: zero output projection so the residual block starts as identity.
+            for layer in self.encoder.layers:
+                nn.init.zeros_(layer.ipa.linear_out.weight)
+                nn.init.zeros_(layer.ipa.linear_out.bias)
 
         # Cross-attention onboarding: cross_gate=0 alone is sufficient. Zero-initialising
         # both the gate AND cross_attn.out.weight produces a gradient deadlock —
@@ -349,7 +354,7 @@ class CausalARModel(nn.Module):
 
     def _build_decoder_input(self, x_input, context, offset: int = 0):
         B, T_in = x_input.shape
-        C = self.NUM_CHANNELS
+        C = self.latent_dim
         device = x_input.device
 
         positions = torch.arange(offset, offset + T_in, device=device)
@@ -423,7 +428,7 @@ class CausalARModel(nn.Module):
         use_cache: bool = True,
     ) -> torch.Tensor:
         L = num_residues
-        C = self.NUM_CHANNELS
+        C = self.latent_dim
         S = L * C
         device = device if device is not None else next(self.parameters()).device
 
