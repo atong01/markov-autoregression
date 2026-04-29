@@ -1,17 +1,17 @@
 #!/bin/bash
 #SBATCH --job-name=mars-ar-overfit
-#SBATCH --time=3:00:00
+#SBATCH --time=1:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=60G
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
-#SBATCH --array=0-4%1
+#SBATCH --array=0-3%1
 #SBATCH --account=rrg-bengioy-ad
 #SBATCH --gpus=h100:1
 #SBATCH --open-mode=append            # Do not overwrite logs
-#SBATCh --partition=gpubase_bynode_b1
+#SBATCH --partition=gpubase_bygpu_b1
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ set -euo pipefail
 # A pipeline sanity check: train on a single protein and watch the loss
 # drop substantially over many epochs. If the loss stays near log(num_bins)
 # something is wrong end-to-end.
-RUN_NAME="4AA_ar_overfit_euclidean_calpha"
+RUN_NAME="4AA_ar_overfit_euclidean_backbone_noaug"
 WANDB_NAME="${RUN_NAME}"
 OVERFIT_PROTEIN="${OVERFIT_PROTEIN:-EFPT}"
 
@@ -81,6 +81,6 @@ srun python -m scripts.train \
   --num_workers 1 --lr 5e-4 \
   --ar --num_bins 16384 --auto_discretize_range --discretize_std_k 4.5 \
   --calibration_batches 4 --label_smoothing 0.0 --bf16 \
-  --euclidean --ca_only \
-  --msm_lagtime 200 \
+  --euclidean \
+  --msm_lagtime 200
 

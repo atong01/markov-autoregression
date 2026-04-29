@@ -21,6 +21,7 @@ def parse_train_args():
     data.add_argument("--euclidean", action="store_true")
     data.add_argument("--ca_only", action="store_true")
     data.add_argument("--s_translation", type=float, default=1.0)
+    data.add_argument("--se3_augmentation", action="store_true")
 
     # ---- MSM / clustering ----
     msm = parser.add_argument_group("MSM clustering")
