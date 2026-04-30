@@ -4,7 +4,7 @@ import numpy as np
 import argparse
 import os
 from multiprocessing import Pool
-from functools import partial
+from tqdm import tqdm
 
 MDCATH_PICOSECONDS_PER_FRAME = 1000.
 
@@ -40,6 +40,7 @@ def _extract_structure_and_coordinates(h5, code, temp, replica):
         coords = h5[code][f"{temp}"][f"{replica}"]["coords"][:]
         box = h5[code][f"{temp}"][f"{replica}"]["box"][:]
     coords = coords / 10.0
+    coords -= coords.mean(axis=1, keepdims=True)
     return pdbfile.name, coords, box
 
 
@@ -229,9 +230,9 @@ def main():
 
     if args.num_workers > 1:
         with Pool(args.num_workers) as pool:
-            pool.map(_convert_worker, work_items)
+            list(tqdm(pool.imap_unordered(_convert_worker, work_items), total=len(work_items), unit="file"))
     else:
-        for item in work_items:
+        for item in tqdm(work_items, unit="file"):
             _convert_worker(item)
 
 
