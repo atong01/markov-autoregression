@@ -10,9 +10,9 @@ from ..data.geometry import frames_torsions_to_atom14
 from ..vendored.openfold.rigid_utils import Rigid, Rotation
 from ..vendored.openfold.tensor_utils import tensor_tree_map
 from ..vendored.ema import ExponentialMovingAverage
-from ..transport import Transport, Sampler
+from ..transport import Transport, Sampler, MeanFlowTransport, MeanFlowSampler
 from ..utils import get_offsets
-from .model import MarSModel
+from .model import MarSModel, MarSMeanFlowModel
 
 logger = logging.getLogger(__name__)
 
@@ -204,3 +204,36 @@ class MarSModule(BaseModule):
         loss = out_dict["loss"].mean()
         self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True)
         return loss
+
+
+class MarSMeanFlowModule(MarSModule):
+    """Mean-flow (flow-map) variant. Trains u_θ(z, r, t) via MeanFlowTransport.
+
+    `general_step` is inherited from MarSModule because the transport API is
+    identical. Only the model, transport, sampler, and inference path differ.
+    """
+
+    def _build_model(self):
+        self.model = MarSMeanFlowModel(self.args, self.latent_dim)
+        self.transport = MeanFlowTransport(
+            neq_frac=getattr(self.args, "mf_neq_frac", 0.25),
+            use_lognormal=getattr(self.args, "mf_lognormal", False),
+            uniform_temporal_sampling=getattr(self.args, "mf_uniform_t", True),
+        )
+        self.sampler = MeanFlowSampler(
+            n_steps=int(getattr(self.args, "mf_n_steps", 8))
+        )
+
+    def inference(self, batch, num_steps=None):
+        rigids = self._build_rigids(batch)
+        B, T, L = rigids.shape
+        latents = self._build_latents(batch, rigids)
+        model_kwargs = self._build_model_kwargs(batch, rigids, latents)
+
+        # Initial state at t=1 is pure noise; integrate down to t=0 via the
+        # mean-velocity Euler steps in MeanFlowSampler.
+        zs = torch.randn(B, T, L, self.latent_dim, device=self.device)
+        samples = self.sampler.sample(
+            zs, self.model, n_steps=num_steps, **model_kwargs
+        )
+        return self._decode_samples(samples, rigids, batch["seqres"])

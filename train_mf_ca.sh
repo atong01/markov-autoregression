@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=mars-ar-ca.sh
+#SBATCH --job-name=mars-mf-ca.sh
 #SBATCH --partition=long
 #SBATCH --time=120:00:00
 #SBATCH --nodes=1
@@ -13,14 +13,14 @@
 set -euo pipefail
 
 # ---- Run identity --------------------------------------------------------
-# Full mdCATH AR training over Cartesian C-alpha coordinates instead of
-# frames+torsions. The latent for each residue is its 3-vector CA position,
-# so per-residue tokens = 3 (x, y, z) and AR generates them residue-major.
-# The discretizer is calibrated per-channel from training data: 3 independent
-# [μ-kσ, μ+kσ] ranges over the (x, y, z) marginals, each carved into num_bins.
-# IPA is auto-disabled in the encoder under --euclidean (see CausalARModel),
-# so the encoder is RoPE-MHA over the per-residue starting coords + sequence.
-RUN_NAME="mdcath_ar_ca_v7_rotary"
+# Full mdCATH training with the mean-flow (flow-map) objective on Cartesian
+# C-alpha coordinates. Per-residue latent = the residue's CA 3-vector, so
+# latent_dim=3. IPA is auto-disabled in the encoder under --euclidean (see
+# MarSMeanFlowModel inheriting from MarSModel: the encoder reduces to RoPE-MHA
+# over per-residue starting coords + sequence). Mean-flow target is the
+# stop-grad identity u_tgt = (ε − x) − (t − r) · ∂_t u with t=0 → data,
+# t=1 → noise; sampling integrates Euler from t=1 to t=0 (--mf_n_steps).
+RUN_NAME="mdcath_mf_ca_v1"
 WANDB_NAME="${RUN_NAME}"
 
 WORKDIR_ROOT="/home/mila/d/danyal.rehman/scratch/mdcath/workdir"
@@ -33,15 +33,12 @@ export HF_HOME="${WORKDIR_ROOT}/.hf"
 mkdir -p logs "${WORKDIR_ROOT}" "${WANDB_CACHE_DIR}" "${WANDB_CONFIG_DIR}" \
          "${TORCH_HOME}" "${HF_HOME}"
 
-# Hyperparameters mirror train_ar.sh except for the Euclidean-CA-specific
-# additions:
+# Mean-flow + Euclidean-CA specifics:
 #   --euclidean --ca_only       -> latent_dim=3 (one CA atom × 3 coords)
-#   --s_translation 1.0         -> mild translation augmentation; widens bins
-#                                  by ~5%, keep small to preserve precision
-# num_bins kept at 8192: with ±4σ over a ~20Å protein extent, bin width is
-# ~0.01Å — fine enough to faithfully represent CA dynamics. Calibration runs
-# on 32 batches before fit() so all DDP ranks derive identical bounds from
-# the same RNG-deterministic loader pass.
+#   --s_translation 1.0         -> mild translation augmentation
+#   --mean_flow                 -> MarSMeanFlowModule (u(z, r, t))
+#   --mf_neq_frac 0.25          -> 25% non-equal r,t pairs; rest boundary
+#   --mf_n_steps 8              -> Euler integration steps at inference
 srun python -m scripts.train \
   --train_split splits/mdCATH_train.csv --val_split splits/mdCATH_val.csv \
   --data_dir /home/mila/d/danyal.rehman/scratch/mdcath/md_cath_processed \
@@ -52,5 +49,4 @@ srun python -m scripts.train \
   --msm_num_states 10 --clusters_per_batch 2 --samples_per_cluster 12 \
   --msm_lagtime 50 --data_temperature 450 \
   --euclidean --ca_only --s_translation 1.0 \
-  --ar --num_bins 8192 --auto_discretize_range --discretize_std_k 4.0 \
-  --calibration_batches 32 --label_smoothing 0.05 --bf16
+  --mean_flow --mf_neq_frac 0.25 --mf_n_steps 8 --bf16

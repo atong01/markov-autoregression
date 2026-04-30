@@ -56,6 +56,9 @@ def _build_module(args):
     if getattr(args, "ar", False):
         from markov_autoregression.model.autoregressive_model import MarSARModule
         return MarSARModule(args)
+    if getattr(args, "mean_flow", False):
+        from markov_autoregression.model.module import MarSMeanFlowModule
+        return MarSMeanFlowModule(args)
     from markov_autoregression.model.module import MarSModule
     return MarSModule(args)
 

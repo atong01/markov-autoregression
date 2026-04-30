@@ -8,6 +8,8 @@ Efficiency / quality features:
 - F.scaled_dot_product_attention (Flash Attention compatible) everywhere.
 - KV cache during generation; the encoder context is computed once and reused.
 - RMSNorm + SwiGLU FFN (LLaMA-style decoder blocks).
+- LLaMA-style RoPE in causal self-attention (relative positions; safe to
+  inference at any sequence length, not bounded by the training crop).
 - Cross-attention from causal tokens to bidirectional per-residue context, with
   QK-norm for attention stability, zero-initialised output projection, and a
   learnable tanh gate (starts at 0, opens during training).
@@ -66,12 +68,16 @@ def _norm(use_rms: bool, dim: int) -> nn.Module:
     return RMSNorm(dim) if use_rms else nn.LayerNorm(dim)
 
 
-def _sincos_pos(seq_len: int, dim: int, device) -> torch.Tensor:
-    omega = torch.arange(dim // 2, dtype=torch.float32, device=device) / (dim / 2)
-    omega = 1.0 / (10000 ** omega)
-    pos = torch.arange(seq_len, dtype=torch.float32, device=device)
-    out = torch.einsum("m,d->md", pos, omega)
-    return torch.cat([out.sin(), out.cos()], dim=-1)
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """LLaMA-style half-rotate: split last dim, return concat([-x2, x1])."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE to x (..., T, D) using cos/sin (T, D); broadcasts over leading dims."""
+    return x * cos + _rotate_half(x) * sin
 
 
 # ---------------------------------------------------------------------------
@@ -131,15 +137,47 @@ class StructureEncoder(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    """Causal MHA with KV cache via F.scaled_dot_product_attention."""
+    """Causal MHA with RoPE on q,k and KV cache via F.scaled_dot_product_attention.
 
-    def __init__(self, embed_dim, num_heads):
+    RoPE is applied at absolute positions [offset, offset+T) on q and the NEW
+    chunk of k before caching; cached k is therefore already rotated, so concat
+    of past and new k is consistent at the absolute-position level. This makes
+    the attention positions effectively relative and length-extrapolation safe
+    — inference can use sequences longer than the training crop without any
+    fixed-size buffer.
+    """
+
+    def __init__(self, embed_dim, num_heads, rope_base: float = 10000.0):
         super().__init__()
         assert embed_dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        assert self.head_dim % 2 == 0, "RoPE requires even head_dim"
         self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
         self.out = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.rope_base = rope_base
+        # Lazy cos/sin tables, extended on demand if a longer sequence shows up
+        # at inference. Non-persistent — not saved to checkpoints.
+        self.register_buffer("_rope_cos", torch.empty(0), persistent=False)
+        self.register_buffer("_rope_sin", torch.empty(0), persistent=False)
+
+    def _rope_tables(self, seq_len: int, device, dtype):
+        if (
+            self._rope_cos.numel() == 0
+            or self._rope_cos.shape[0] < seq_len
+            or self._rope_cos.device != device
+        ):
+            half = self.head_dim // 2
+            inv_freq = 1.0 / (
+                self.rope_base
+                ** (torch.arange(0, half, device=device, dtype=torch.float32) * 2 / self.head_dim)
+            )
+            t = torch.arange(seq_len, device=device, dtype=torch.float32)
+            freqs = torch.einsum("i,j->ij", t, inv_freq)            # (seq_len, half)
+            emb = torch.cat([freqs, freqs], dim=-1)                  # (seq_len, head_dim)
+            self._rope_cos = emb.cos()
+            self._rope_sin = emb.sin()
+        return self._rope_cos[:seq_len].to(dtype), self._rope_sin[:seq_len].to(dtype)
 
     def forward(self, x, kv_cache=None):
         B, T, C = x.shape
@@ -148,7 +186,14 @@ class CausalSelfAttention(nn.Module):
             .reshape(B, T, 3, self.num_heads, self.head_dim)
             .permute(2, 0, 3, 1, 4)
         )
-        q, k, v = qkv.unbind(0)
+        q, k, v = qkv.unbind(0)                                      # (B, H, T, head_dim)
+
+        offset = kv_cache[0].shape[2] if kv_cache is not None else 0
+        cos, sin = self._rope_tables(offset + T, q.device, q.dtype)
+        cos_q = cos[offset:offset + T]                               # (T, head_dim)
+        sin_q = sin[offset:offset + T]
+        q = _apply_rope(q, cos_q, sin_q)
+        k = _apply_rope(k, cos_q, sin_q)
 
         if kv_cache is not None:
             past_k, past_v = kv_cache
@@ -281,13 +326,6 @@ class CausalARModel(nn.Module):
         self.token_emb = nn.Embedding(self.num_bins + 1, self.embed_dim)
         self.channel_emb = nn.Embedding(self.latent_dim, self.embed_dim)
 
-        max_seq = args.crop * self.latent_dim
-        self.register_buffer(
-            "seq_pos_embed",
-            _sincos_pos(max_seq, self.embed_dim, "cpu"),
-            persistent=False,
-        )
-
         ipa_args = dict(
             c_s=self.embed_dim,
             c_z=0,
@@ -362,7 +400,8 @@ class CausalARModel(nn.Module):
 
         h = self.token_emb(x_input)
         h = h + self.channel_emb(ch_idx).unsqueeze(0)
-        h = h + self.seq_pos_embed[offset:offset + T_in].to(device).unsqueeze(0)
+        # Sequence position is injected via RoPE inside CausalSelfAttention; no
+        # absolute position embedding here, so sequence length is unbounded.
 
         if not self.use_cross_attn:
             # Fall back: additive per-residue context.

@@ -120,3 +120,121 @@ class Sampler:
             num_steps=num_steps, atol=atol, rtol=rtol,
         )
         return integrator.sample
+
+
+# ---------------------------------------------------------------------------
+# Mean-flow (flow-map) training & sampling
+# ---------------------------------------------------------------------------
+#
+# MeanFlow learns u_θ(z, r, t): the *average* drift from time r to time t along
+# a linear interpolant z = t·ε + (1−t)·x with ε ~ N(0, I). Time direction is
+# opposite to the GVP-C flow-matching path used elsewhere in this file:
+#
+#   t = 0 → data,    t = 1 → noise.
+#
+# Training target (stop-grad):
+#
+#   v       = ε − x                        (instantaneous velocity at t)
+#   u, ∂u   = JVP of u_θ at (z, r, t) along (v, 0, 1)
+#   u_tgt   = v − (t − r) · ∂u             (detached)
+#   loss    = ‖u − u_tgt‖²
+#
+# Sampling: Euler steps in *decreasing* t from 1 to 0 with mean-velocity step
+# z ← z − (t_i − t_{i+1})·u_θ(z, t_{i+1}, t_i).
+
+
+def _expand(t, x):
+    return t.view(t.shape[0], *([1] * (x.ndim - 1)))
+
+
+class MeanFlowTransport:
+    """Mean-flow training objective (meanflow_loss only)."""
+
+    def __init__(
+        self,
+        neq_frac: float = 0.25,
+        use_lognormal: bool = False,
+        uniform_temporal_sampling: bool = True,
+    ):
+        self.neq_frac = neq_frac
+        self.use_lognormal = use_lognormal
+        self.uniform_temporal_sampling = uniform_temporal_sampling
+
+    def _sample_rt(self, B: int, device):
+        if self.uniform_temporal_sampling:
+            t = torch.rand(B, device=device)
+            r = torch.rand(B, device=device) * t
+            return r, t
+
+        if self.use_lognormal:
+            dist = torch.distributions.LogNormal(-0.4, 1.0)
+            t = dist.sample((B,)).to(device)
+            r = dist.sample((B,)).to(device)
+        else:
+            t = torch.rand(B, device=device)
+            r = torch.rand(B, device=device)
+
+        # neq_frac of the batch keeps r ≠ t; the remainder is collapsed to r = t
+        # (boundary regression: u(z, t, t) = v).
+        eq_mask = torch.rand(B, device=device) > self.neq_frac
+        r = torch.where(eq_mask, t, r)
+
+        # Enforce r ≤ t.
+        swap = r > t
+        r, t = torch.where(swap, t, r), torch.where(swap, r, t)
+        return r, t
+
+    def training_losses(self, model, x1, mask=None, model_kwargs=None):
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        # Mirror Transport.training_losses' pair slicing: target = state at t+τ,
+        # condition = state at t.
+        x = x1[:, 1, :, :].unsqueeze(1)
+        target_mask = mask[:, 1, :, :].unsqueeze(1) if mask is not None else None
+        kwargs = dict(model_kwargs)
+        kwargs["mask"] = kwargs["mask"][:, 1, :].unsqueeze(1)
+        kwargs["x_cond"] = kwargs["x_cond"][:, 0, :, :].unsqueeze(1)
+        kwargs["x_cond_mask"] = kwargs["x_cond_mask"][:, 0, :].unsqueeze(1)
+
+        B = x.shape[0]
+        r, t = self._sample_rt(B, x.device)
+
+        eps = torch.randn_like(x)
+        t_x = _expand(t, x)
+        z = t_x * eps + (1 - t_x) * x
+        v = eps - x
+
+        def _fn(z_, r_, t_):
+            return model(z_, r_, t_, **kwargs)
+
+        u, dudt = torch.func.jvp(
+            _fn,
+            (z, r, t),
+            (v, torch.zeros_like(r), torch.ones_like(t)),
+        )
+
+        diff = _expand(t - r, x)
+        u_target = (v - diff * dudt).detach()
+
+        loss = _mean_flat((u - u_target) ** 2, target_mask)
+        return {"r": r, "t": t, "pred": u, "loss": loss}
+
+
+class MeanFlowSampler:
+    """Multi-step mean-flow Euler sampler from t=1 (noise) to t=0 (data)."""
+
+    def __init__(self, n_steps: int = 8):
+        self.n_steps = n_steps
+
+    @torch.no_grad()
+    def sample(self, z, model, n_steps: int = None, **model_kwargs):
+        n = n_steps if n_steps is not None else self.n_steps
+        ts = torch.linspace(1.0, 0.0, n + 1, device=z.device, dtype=torch.float32)
+        B = z.shape[0]
+        for i in range(n):
+            t = ts[i].expand(B)
+            r = ts[i + 1].expand(B)
+            u = model(z, r, t, **model_kwargs)
+            z = z - _expand(t - r, z) * u
+        return z

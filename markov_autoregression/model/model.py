@@ -237,6 +237,50 @@ class MarSModel(nn.Module):
         return latent
 
 
+class MarSMeanFlowModel(MarSModel):
+    """MarSModel that conditions on two times (r, t) instead of one.
+
+    Used for mean-flow / flow-map training. The conditioning vector is the sum
+    of independent embeddings of r and t, fed everywhere t is fed in MarSModel.
+    """
+
+    def __init__(self, args, latent_dim):
+        super().__init__(args, latent_dim)
+        self.r_embedder = TimestepEmbedder(args.embed_dim)
+        nn.init.normal_(self.r_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.r_embedder.mlp[2].weight, std=0.02)
+
+    def forward(
+        self,
+        x,
+        r,
+        t,
+        mask,
+        start_frames=None,
+        x_cond=None,
+        x_cond_mask=None,
+        aatype=None,
+    ):
+        x = self.latent_to_emb(x)
+        if self.args.abs_pos_emb:
+            x = x + self.pos_embed
+
+        if x_cond is not None:
+            x = x + self.cond_to_emb(x_cond) + self.mask_to_emb(x_cond_mask)
+
+        c = (
+            self.t_embedder(t * TIME_MULTIPLIER)
+            + self.r_embedder(r * TIME_MULTIPLIER)
+        )[:, None]
+
+        x = x + self.run_ipa(c[:, 0], mask[:, 0], start_frames, aatype)[:, None]
+
+        for layer in self.layers:
+            x = layer(x, c, mask)
+
+        return self.emb_to_latent(x, c)
+
+
 class IPALayer(nn.Module):
     def __init__(self, embed_dim, ffn_embed_dim, mha_heads, ipa_args=None):
         super().__init__()

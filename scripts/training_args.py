@@ -1,7 +1,7 @@
 """Command-line argument parser for MarS training."""
 
 import os
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 
 
 def parse_train_args():
@@ -81,6 +81,24 @@ def parse_train_args():
                     help="Number of training batches sampled during calibration.")
     ar.add_argument("--bf16", action="store_true",
                     help="Use bf16-mixed precision (recommended for AR training).")
+
+    # ---- Mean-flow (flow-map) -----
+    mf = parser.add_argument_group("MeanFlow")
+    mf.add_argument("--mean_flow", action="store_true",
+                    help="Train with the mean-flow objective (u(z, r, t)) "
+                         "instead of conventional flow matching.")
+    mf.add_argument("--mf_neq_frac", type=float, default=0.25,
+                    help="Fraction of training samples with r ≠ t; the rest "
+                         "are collapsed to r = t (boundary regression).")
+    mf.add_argument("--mf_uniform_t", action=BooleanOptionalAction, default=True,
+                    help="Sample t ~ U(0,1) and r = u·t (u ~ U(0,1)). Default. "
+                         "Pass --no-mf_uniform_t to draw r,t independently.")
+    mf.add_argument("--mf_lognormal", action="store_true",
+                    help="When --no-mf_uniform_t is set, draw r,t from "
+                         "LogNormal(-0.4, 1.0) instead of U(0,1).")
+    mf.add_argument("--mf_n_steps", type=int, default=8,
+                    help="Number of Euler steps for mean-flow sampling at "
+                         "inference (1 = single-step; larger = closer to FM).")
 
     # ---- Logging ----
     log = parser.add_argument_group("Logging")
