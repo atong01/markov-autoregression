@@ -213,6 +213,12 @@ class MarSMeanFlowModule(MarSModule):
     identical. Only the model, transport, sampler, and inference path differ.
     """
 
+    def _init_latent_dim(self):
+        if getattr(self.args, "euclidean", False):
+            n_atoms = 1 if getattr(self.args, "ca_only", False) else 4
+            return n_atoms * 3
+        return 21
+
     def _build_model(self):
         self.model = MarSMeanFlowModel(self.args, self.latent_dim)
         self.transport = MeanFlowTransport(
@@ -224,10 +230,76 @@ class MarSMeanFlowModule(MarSModule):
             n_steps=int(getattr(self.args, "mf_n_steps", 8))
         )
 
+    # ----- Euclidean overrides ----------------------------------------------
+
+    def _pair_with_tau(self, batch):
+        if "coords" not in batch:
+            super()._pair_with_tau(batch)
+            return
+        B, T = batch["coords"].shape[:2]
+        rest = batch["coords"].shape[2:]
+        batch["coords"] = torch.stack(
+            [
+                batch["coords"].reshape(B * T, *rest),
+                batch["coords_plus_tau"].reshape(B * T, *rest),
+            ],
+            dim=1,
+        )
+        for key in ["mask", "seqres"]:
+            batch[key] = (
+                batch[key]
+                .unsqueeze(1)
+                .expand(B, T, *batch[key].shape[1:])
+                .reshape(B * T, *batch[key].shape[1:])
+            )
+
+    def _build_rigids(self, batch):
+        if "coords" in batch:
+            return None
+        return super()._build_rigids(batch)
+
+    def _build_latents(self, batch, rigids):
+        if "coords" not in batch:
+            return super()._build_latents(batch, rigids)
+        coords = batch["coords"]
+        Bt, two, L = coords.shape[:3]
+        return coords.reshape(Bt, two, L, self.latent_dim)
+
+    def _build_loss_mask(self, batch, rigids):
+        if rigids is not None:
+            return super()._build_loss_mask(batch, rigids)
+        Bt, L = batch["mask"].shape
+        return (
+            batch["mask"].view(Bt, 1, L, 1).expand(Bt, 2, L, self.latent_dim)
+        )
+
+    def _build_model_kwargs(self, batch, rigids, latents):
+        if rigids is not None:
+            return super()._build_model_kwargs(batch, rigids, latents)
+        Bt, T, L, _ = latents.shape
+        x_cond, x_cond_mask = self._build_conditioning(latents)
+        return {
+            "start_frames": None,
+            "mask": batch["mask"].unsqueeze(1).expand(-1, T, -1),
+            "aatype": batch["seqres"].long(),
+            "x_cond": x_cond,
+            "x_cond_mask": x_cond_mask,
+        }
+
+    def _decode_samples(self, samples, rigids, seqres):
+        if not getattr(self.args, "euclidean", False):
+            return super()._decode_samples(samples, rigids, seqres)
+        Bt, T, L, D = samples.shape
+        coords = samples.reshape(Bt, T, L, D // 3, 3)
+        return coords, seqres[:, None].expand(Bt, T, L)
+
     def inference(self, batch, num_steps=None):
         rigids = self._build_rigids(batch)
-        B, T, L = rigids.shape
         latents = self._build_latents(batch, rigids)
+        if rigids is not None:
+            B, T, L = rigids.shape
+        else:
+            B, T, L, _ = latents.shape
         model_kwargs = self._build_model_kwargs(batch, rigids, latents)
 
         # Initial state at t=1 is pure noise; integrate down to t=0 via the

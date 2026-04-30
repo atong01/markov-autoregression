@@ -114,6 +114,7 @@ class MarSModel(nn.Module):
     def __init__(self, args, latent_dim):
         super().__init__()
         self.args = args
+        self.use_ipa = not getattr(args, "euclidean", False)
 
         self.latent_to_emb = nn.Linear(latent_dim, args.embed_dim)
         self.cond_to_emb = nn.Linear(latent_dim, args.embed_dim)
@@ -136,6 +137,7 @@ class MarSModel(nn.Module):
                     ffn_embed_dim=4 * args.embed_dim,
                     mha_heads=args.mha_heads,
                     ipa_args=ipa_args,
+                    use_ipa=self.use_ipa,
                 )
                 for _ in range(args.num_layers)
             ]
@@ -172,9 +174,10 @@ class MarSModel(nn.Module):
 
         self.apply(_basic_init)
 
-        for block in self.ipa_layers:
-            nn.init.constant_(block.ipa.linear_out.weight, 0)
-            nn.init.constant_(block.ipa.linear_out.bias, 0)
+        if self.use_ipa:
+            for block in self.ipa_layers:
+                nn.init.constant_(block.ipa.linear_out.weight, 0)
+                nn.init.constant_(block.ipa.linear_out.bias, 0)
 
         if self.args.abs_pos_emb:
             pos_embed = _sincos_pos_embed(
@@ -282,15 +285,17 @@ class MarSMeanFlowModel(MarSModel):
 
 
 class IPALayer(nn.Module):
-    def __init__(self, embed_dim, ffn_embed_dim, mha_heads, ipa_args=None):
+    def __init__(self, embed_dim, ffn_embed_dim, mha_heads, ipa_args=None, use_ipa=True):
         super().__init__()
+        self.use_ipa = use_ipa
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(embed_dim, 6 * embed_dim, bias=True)
         )
 
-        self.ipa_norm = nn.LayerNorm(embed_dim)
-        self.ipa = InvariantPointAttention(**ipa_args)
+        if self.use_ipa:
+            self.ipa_norm = nn.LayerNorm(embed_dim)
+            self.ipa = InvariantPointAttention(**ipa_args)
 
         self.mha_l = AttentionWithRoPE(
             embed_dim, mha_heads, add_bias_kv=True, use_rotary_embeddings=True,
@@ -307,7 +312,8 @@ class IPALayer(nn.Module):
         shift_msa_l, scale_msa_l, gate_msa_l, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(t).chunk(6, dim=-1)
         )
-        x = x + self.ipa(self.ipa_norm(x), frames, frame_mask=mask)
+        if self.use_ipa:
+            x = x + self.ipa(self.ipa_norm(x), frames, frame_mask=mask)
 
         residual = x
         x = modulate(self.mha_layer_norm(x), shift_msa_l, scale_msa_l)
