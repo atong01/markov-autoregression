@@ -24,10 +24,8 @@ class BaseModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.args = args
-        self.latent_dim = 21
-        self.model = MarSModel(args, self.latent_dim)
-        self.transport = Transport()
-        self.sampler = Sampler(self.transport)
+        self.latent_dim = self._init_latent_dim()
+        self._build_model()
 
         if getattr(args, "ema", False):
             self.ema = ExponentialMovingAverage(
@@ -35,16 +33,25 @@ class BaseModule(pl.LightningModule):
             )
             self.cached_weights = None
 
+    def _init_latent_dim(self):
+        return 21
+
+    def _build_model(self):
+        """Hook for subclasses to swap the network and sampling machinery."""
+        self.model = MarSModel(self.args, self.latent_dim)
+        self.transport = Transport()
+        self.sampler = Sampler(self.transport)
+
     # -- EMA helpers ----------------------------------------------------------
 
     def load_ema_weights(self):
-        logger.info("Loading EMA weights")
+        logger.debug("Loading EMA weights")
         clone_param = lambda t: t.detach().clone()
         self.cached_weights = tensor_tree_map(clone_param, self.model.state_dict())
         self.model.load_state_dict(self.ema.state_dict()["params"])
 
     def restore_cached_weights(self):
-        logger.info("Restoring cached weights")
+        logger.debug("Restoring cached weights")
         self.model.load_state_dict(self.cached_weights)
         self.cached_weights = None
 

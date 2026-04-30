@@ -19,14 +19,12 @@ produces `num_bins` logits aligned with the targets.
 import logging
 from typing import Optional
 
-import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 
 from ..data.discretize import DiscretizeTransform
 from ..neural_networks.causal_transformer import CausalARModel
-from ..vendored.ema import ExponentialMovingAverage
-from .module import BaseModule
+from .module import MarSModule
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +49,16 @@ def _filter_logits(logits: torch.Tensor, top_k=None, top_p=None) -> torch.Tensor
     return logits
 
 
-class MarSARModule(BaseModule):
+class MarSARModule(MarSModule):
     """Autoregressive analogue of MarSModule.
 
-    Reuses BaseModule for rigid/latent construction, EMA, and atom14 decode.
-    Overrides general_step (cross-entropy over discretized bins) and inference
-    (KV-cached AR sampling). Adds compute_log_likelihood for exact likelihood
-    evaluation, and an on_fit_start hook that calibrates per-channel
-    discretization bounds from the training data (μ ± k·σ).
+    Inherits batch pairing, rigid/latent construction, loss masking, EMA, and
+    atom14 decode from MarSModule/BaseModule. Diverges in just two places:
+    the model (`CausalARModel` instead of `MarSModel`) and the loss
+    (cross-entropy over discretized bins instead of flow-matching MSE).
+    Adds `compute_log_likelihood` for exact likelihood evaluation and an
+    `on_fit_start` hook that calibrates per-channel discretization bounds
+    from the training data (μ ± k·σ).
     """
 
     # Discretized-then-undiscretized (sin, cos) torsion components do not
@@ -68,63 +68,38 @@ class MarSARModule(BaseModule):
     # rotation. Critical for downstream drug-discovery use of generated geom.
     normalize_torsions = True
 
-    def __init__(self, args):
-        # Skip BaseModule.__init__ so we don't instantiate the flow MarSModel.
-        pl.LightningModule.__init__(self)
-        self.save_hyperparameters()
-        self.args = args
-        if getattr(args, "euclidean", False):
-            n_atoms = 1 if getattr(args, "ca_only", False) else 4
-            self.latent_dim = n_atoms * 3
-        else:
-            self.latent_dim = 21
+    def _init_latent_dim(self):
+        if getattr(self.args, "euclidean", False):
+            n_atoms = 1 if getattr(self.args, "ca_only", False) else 4
+            return n_atoms * 3
+        return 21
 
-        self.model = CausalARModel(args, self.latent_dim)
+    def _build_model(self):
+        self.model = CausalARModel(self.args, self.latent_dim)
         self.discretize = DiscretizeTransform(
-            num_bins=args.num_bins,
-            min_val=args.discretize_min,
-            max_val=args.discretize_max,
+            num_bins=self.args.num_bins,
+            min_val=self.args.discretize_min,
+            max_val=self.args.discretize_max,
             latent_dim=self.latent_dim,
         )
         self._calibrated = False
 
-        if getattr(args, "ema", False):
-            self.ema = ExponentialMovingAverage(model=self.model, decay=args.ema_decay)
-            self.cached_weights = None
-
     # ----- Batch reshaping ---------------------------------------------------
 
-    @staticmethod
-    def _pair_with_tau(batch):
-        if "coords" in batch:
-            B, T = batch["coords"].shape[:2]
-            rest = batch["coords"].shape[2:]
-            batch["coords"] = torch.stack(
-                [
-                    batch["coords"].reshape(B * T, *rest),
-                    batch["coords_plus_tau"].reshape(B * T, *rest),
-                ],
-                dim=1,
-            )
-            for key in ["mask", "seqres"]:
-                batch[key] = (
-                    batch[key]
-                    .unsqueeze(1)
-                    .expand(B, T, *batch[key].shape[1:])
-                    .reshape(B * T, *batch[key].shape[1:])
-                )
+    def _pair_with_tau(self, batch):
+        if "coords" not in batch:
+            super()._pair_with_tau(batch)
             return
-        for key in ["trans", "rots", "torsions"]:
-            B, T = batch[key].shape[:2]
-            rest = batch[key].shape[2:]
-            batch[key] = torch.stack(
-                [
-                    batch[key].reshape(B * T, *rest),
-                    batch[key + "_plus_tau"].reshape(B * T, *rest),
-                ],
-                dim=1,
-            )
-        for key in ["torsion_mask", "mask", "seqres"]:
+        B, T = batch["coords"].shape[:2]
+        rest = batch["coords"].shape[2:]
+        batch["coords"] = torch.stack(
+            [
+                batch["coords"].reshape(B * T, *rest),
+                batch["coords_plus_tau"].reshape(B * T, *rest),
+            ],
+            dim=1,
+        )
+        for key in ["mask", "seqres"]:
             batch[key] = (
                 batch[key]
                 .unsqueeze(1)
@@ -326,8 +301,21 @@ class MarSARModule(BaseModule):
 
     # ----- Training step -----------------------------------------------------
 
+    def _token_loss_mask(self, batch, rigids):
+        """Per-token mask flattened over residues × channels for AR loss/LL.
+
+        Non-euclidean: combines residue padding with per-residue torsion
+        validity (from `_build_loss_mask`), so cross-entropy is not penalised
+        on, e.g., the χ4 channels of a glycine. Euclidean: just residue
+        padding — Cartesian coords have no per-channel validity concept.
+        """
+        if rigids is None:
+            return batch["mask"].repeat_interleave(self.latent_dim, dim=1).float()
+        full = self._build_loss_mask(batch, rigids)             # (Bt, 2, L, 21)
+        Bt, _, L, D = full.shape
+        return full[:, 1].reshape(Bt, L * D).float()
+
     def general_step(self, batch, stage: str = "train"):
-        batch = dict(batch)
         self._pair_with_tau(batch)
         rigids = self._build_rigids(batch)              # (Bt, 2, L)
         latents = self._build_latents(batch, rigids)    # (Bt, 2, L, 21)
@@ -343,7 +331,7 @@ class MarSARModule(BaseModule):
         logits, _ = self.model(x_input, encodings=encodings)    # (Bt, L*D, V)
 
         # Cross-entropy: predicted bin distribution vs. ground-truth bin index,
-        # per token, then masked-mean over valid residues' tokens.
+        # per token, then masked-mean over valid residue × channel tokens.
         ce = F.cross_entropy(
             logits.reshape(-1, self.args.num_bins),
             target_disc.reshape(-1),
@@ -351,8 +339,8 @@ class MarSARModule(BaseModule):
             label_smoothing=getattr(self.args, "label_smoothing", 0.0),
         ).reshape(Bt, L * D)
 
-        coord_mask = batch["mask"].repeat_interleave(D, dim=1).float()
-        loss = (ce * coord_mask).sum() / coord_mask.sum().clamp(min=1)
+        loss_mask = self._token_loss_mask(batch, rigids)
+        loss = (ce * loss_mask).sum() / loss_mask.sum().clamp(min=1)
 
         self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True)
         return loss
@@ -394,8 +382,8 @@ class MarSARModule(BaseModule):
         log_probs = F.log_softmax(logits, dim=-1)
         log_p = log_probs.gather(-1, target_disc.unsqueeze(-1)).squeeze(-1)
 
-        coord_mask = batch["mask"].repeat_interleave(D, dim=1).float()
-        return (log_p * coord_mask).sum(dim=-1)
+        loss_mask = self._token_loss_mask(batch, rigids)
+        return (log_p * loss_mask).sum(dim=-1)
 
     # ----- Inference ---------------------------------------------------------
 

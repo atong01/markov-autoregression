@@ -32,6 +32,8 @@ htmlcov/
 
 # Project-specific
 workdir/
+workdir*/
 *.pkl
 logs/
 *.log
+*.ckpt

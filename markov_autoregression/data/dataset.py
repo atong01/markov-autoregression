@@ -44,6 +44,18 @@ class MarSDatasetBase(torch.utils.data.Dataset):
     def __len__(self):
         return self.repeat * len(self.valid_names)
 
+    def _maybe_seed(self, idx):
+        """Reseed numpy RNG inside __getitem__ for memorization/diagnostic runs.
+
+        With this on, every call with the same `idx` returns the exact same
+        (x_t, x_{t+τ}) realization — same cluster sampling, same in-cluster
+        frame picks, same crop. Required for proving the AR machinery can drive
+        cross-entropy to ~0; without it, the dataset's per-call randomness
+        leaves an irreducible entropy floor on the loss.
+        """
+        if getattr(self.args, "deterministic_dataset", False):
+            np.random.seed(idx)
+
     def _build_transition_matrix(self, clusters_list):
         counts_estimator = deeptime.markov.TransitionCountEstimator(
             self.args.msm_lagtime, "sliding"
@@ -234,6 +246,7 @@ class MarSDataset4AA(MarSDatasetBase):
         }
 
     def __getitem__(self, idx):
+        self._maybe_seed(idx)
         idx = idx % len(self.valid_names)
         # Try up to 3 different samples if we hit corrupted files
         for attempt in range(3):
@@ -363,6 +376,7 @@ class MarSDatasetMDCath(MarSDatasetBase):
         return probabilities, np.unique(all_clusters)
 
     def __getitem__(self, idx):
+        self._maybe_seed(idx)
         idx = idx % len(self.valid_names)
         # Try up to 3 different samples if we hit corrupted files
         for attempt in range(3):

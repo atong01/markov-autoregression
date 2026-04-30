@@ -362,7 +362,14 @@ class CausalARModel(nn.Module):
 
         h = self.token_emb(x_input)
         h = h + self.channel_emb(ch_idx).unsqueeze(0)
-        h = h + self.seq_pos_embed[offset:offset + T_in].to(device).unsqueeze(0)
+        end = offset + T_in
+        if end <= self.seq_pos_embed.shape[0]:
+            pos_emb = self.seq_pos_embed[offset:end].to(device)
+        else:
+            # Inference on proteins longer than args.crop: compute the
+            # sincos positions on the fly rather than indexing the cached buffer.
+            pos_emb = _sincos_pos(end, self.embed_dim, device)[offset:end]
+        h = h + pos_emb.unsqueeze(0)
 
         if not self.use_cross_attn:
             # Fall back: additive per-residue context.

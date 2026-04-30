@@ -22,7 +22,7 @@ import torch
 import tqdm
 from scipy.stats import gaussian_kde
 
-import markov_autoregression.analysis
+import markov_autoregression.analysis as mars_analysis
 from markov_autoregression.vendored.openfold.residue_constants import restype_order
 from markov_autoregression.utils import atom14_to_pdb, set_seed
 
@@ -66,6 +66,15 @@ parser.add_argument(
     "--gen_replicas_savedir",
     type=str,
     default="./workdir/MD_baselines_4",
+)
+parser.add_argument(
+    "--ca_only",
+    action="store_true",
+    help=(
+        "The sampler trajectories only contain Cα coordinates (other atom14 "
+        "slots are zero). Slice both ensembles to Cα before computing metrics. "
+        "Disables secondary-structure metrics (require backbone N/CA/C/O)."
+    ),
 )
 args = parser.parse_args()
 set_seed(args.seed)
@@ -170,7 +179,14 @@ def _kde_minimum(q_vals):
 
 
 def run_folding_analysis(name, mdtraj):
-    """Compute per-domain ΔGfold for generated and MD ensembles."""
+    """Compute per-domain ΔGfold for generated and MD ensembles.
+
+    Disabled when ``--ca_only`` is set: the fraction of native contacts uses
+    minimum heavy-atom distances per residue pair, which is undefined when
+    only Cα coordinates are available in the sampled ensemble.
+    """
+    if args.ca_only:
+        return {}
     settings = FNCSettings()
     top_md = f"{args.mddir}/topology/{name}.pdb"
 
@@ -281,6 +297,12 @@ def run_structural_analysis(name, seqres, mdtraj):
     remove_hydrogens(ref_aa)
     remove_hydrogens(aftraj_aa)
 
+    if args.ca_only:
+        # Sampler atom14 has only Cα populated; the other heavy atoms are
+        # padded zeros and would corrupt alignment / RMSF if kept.
+        for t in (traj_aa, ref_aa, aftraj_aa):
+            t.atom_slice(t.top.select("name CA"), True)
+
     refmask, afmask = align_tops(traj_aa.top, aftraj_aa.top)
     traj_aa.atom_slice(refmask, True)
     ref_aa.atom_slice(refmask, True)
@@ -303,11 +325,11 @@ def run_structural_analysis(name, seqres, mdtraj):
 
     out["af_rmsf"] = mdtraj.rmsf(aftraj_aa, ref_aa) * 10
     out["ref_rmsf"] = mdtraj.rmsf(traj_aa, ref_aa) * 10
-    out["jsd_rmsf"] = mars.analysis.compute_jsd(out["ref_rmsf"], out["af_rmsf"], bins=50)
+    out["jsd_rmsf"] = mars_analysis.compute_jsd(out["ref_rmsf"], out["af_rmsf"], bins=50)
 
     ref_pw = get_rmsds(traj[RAND1].xyz, traj[RAND2].xyz, broadcast=True)
     af_pw = get_rmsds(aftraj.xyz, aftraj.xyz, broadcast=True)
-    out["jsd_pairwise_rmsd"] = mars.analysis.compute_jsd(ref_pw.ravel(), af_pw.ravel(), bins=50)
+    out["jsd_pairwise_rmsd"] = mars_analysis.compute_jsd(ref_pw.ravel(), af_pw.ravel(), bins=50)
     out["ref_mean_pairwise_rmsd"] = ref_pw.mean()
     out["af_mean_pairwise_rmsd"] = af_pw.mean()
 
@@ -318,17 +340,19 @@ def run_observable_analysis(name, mdtraj):
     out = {}
     set_seed(args.seed)
 
-    gr_stats = mars.analysis.compare_gyration_radius_mdcath(
+    gr_stats = mars_analysis.compare_gyration_radius_mdcath(
         args.mddir, args.pdbdir, name,
         temp=args.temp, truncate=args.truncate, gen_replicas=args.gen_replicas,
+        ca_only=args.ca_only,
     )
     out["gyration_radius_difference"] = gr_stats["gyration_radius_difference"]
     out["gyration_radius_KL"] = gr_stats["forward_kl_divergence"]
     out["gyration_radius_JSD"] = gr_stats["jensen_shannon_divergence"]
 
-    ss_stats = mars.analysis.compare_secondary_structure_mdcath(
+    ss_stats = mars_analysis.compare_secondary_structure_mdcath(
         args.mddir, args.pdbdir, name,
         temp=args.temp, truncate=args.truncate, gen_replicas=args.gen_replicas,
+        ca_only=args.ca_only,
     )
     out["ss_difference"] = ss_stats["mean_difference"]
     out["ss_KL"] = ss_stats["forward_kl_divergence"]
@@ -354,23 +378,30 @@ def run_observable_analysis(name, mdtraj):
     if args.truncate:
         traj_samp = traj_samp[: args.truncate]
 
-    FEATURES = [["gr", "secondary"]]
+    if args.ca_only:
+        # DSSP requires backbone N/CA/C/O, so the joint gr+secondary MSM is
+        # not available. Compute the MSM on Rg alone (Cα-derived).
+        FEATURES = [["gr"]]
+        traj_samp = traj_samp.atom_slice(traj_samp.top.select("name CA"))
+        ref_trajs = [t.atom_slice(t.top.select("name CA")) for t in ref_trajs]
+    else:
+        FEATURES = [["gr", "secondary"]]
     out["feature_MSM"] = {}
 
     for feat in FEATURES:
-        kmeans, disc_ref, _ = mars.analysis.fit_kmeans_on_reference(
+        kmeans, disc_ref, _ = mars_analysis.fit_kmeans_on_reference(
             ref_trajs, feat, args.feature_states
         )
         disc_samp = kmeans.transform(
             np.hstack([
-                mars.analysis.compute_feature(traj_samp, f, traj_samp[0])
+                mars_analysis.compute_feature(traj_samp, f, traj_samp[0])
                 for f in feat
             ])
         )
-        pi_ref, symbols_ref = mars.analysis.stationary_dist(
+        pi_ref, symbols_ref = mars_analysis.stationary_dist(
             disc_ref, lag=args.msm_lag
         )
-        pi_samp, symbols_samp = mars.analysis.stationary_dist(
+        pi_samp, symbols_samp = mars_analysis.stationary_dist(
             [disc_samp], lag=args.msm_lag
         )
 
@@ -380,10 +411,10 @@ def run_observable_analysis(name, mdtraj):
         pi_full_samp[symbols_samp] = pi_samp
 
         feat_key = ",".join(feat)
-        out["feature_MSM"][f"{feat_key}_JSD"] = mars.analysis.jsd_from_counts(
+        out["feature_MSM"][f"{feat_key}_JSD"] = mars_analysis.jsd_from_counts(
             pi_full_ref, pi_full_samp, base=None
         )
-        out["feature_MSM"][f"{feat_key}_KL"] = mars.analysis.kl_from_counts(
+        out["feature_MSM"][f"{feat_key}_KL"] = mars_analysis.kl_from_counts(
             pi_full_ref, pi_full_samp
         )
 
@@ -495,10 +526,15 @@ def summarize_observable(data):
             if old in results:
                 collectors[new].append(results[old])
         feat_msm = results.get("feature_MSM", {})
-        if "gr,secondary_JSD" in feat_msm:
-            collectors["MSM JSD"].append(feat_msm["gr,secondary_JSD"])
-        if "gr,secondary_KL" in feat_msm:
-            collectors["MSM KL"].append(feat_msm["gr,secondary_KL"])
+        # Joint gr+secondary MSM (full atom14) or gr-only MSM (Cα-only fallback).
+        for jsd_key in ("gr,secondary_JSD", "gr_JSD"):
+            if jsd_key in feat_msm:
+                collectors["MSM JSD"].append(feat_msm[jsd_key])
+                break
+        for kl_key in ("gr,secondary_KL", "gr_KL"):
+            if kl_key in feat_msm:
+                collectors["MSM KL"].append(feat_msm[kl_key])
+                break
 
     result = {}
     for key, vals in collectors.items():
