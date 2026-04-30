@@ -133,7 +133,7 @@ class MarSDatasetBase(torch.utils.data.Dataset):
             
             coords = center_dense_coords(coords)
             coords_plus_tau = center_dense_coords(coords_plus_tau)
-            if self.args.se3_augmentation:
+            if not getattr(self.args, "no_se3_augmentation", False):
                 coords, coords_plus_tau = geometric_augmentation(coords, coords_plus_tau, s_trans=self.args.s_translation, translate=self.translate)
             
             L = coords.shape[1]

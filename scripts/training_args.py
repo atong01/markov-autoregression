@@ -21,6 +21,8 @@ def parse_train_args():
     data.add_argument("--euclidean", action="store_true")
     data.add_argument("--ca_only", action="store_true")
     data.add_argument("--s_translation", type=float, default=1.0)
+    data.add_argument("--no_se3_augmentation", action="store_true",
+                      help="Turn off SE(3) augmentations. Use for memorization tests.")
     data.add_argument("--deterministic_dataset", action="store_true",
                       help="Make __getitem__ produce the same sample for the same idx every "
                            "call by reseeding numpy RNG inside it. Use for memorization tests.")
