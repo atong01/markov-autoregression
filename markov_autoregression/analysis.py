@@ -266,12 +266,16 @@ def stationary_dist(discrete_trajs, lag):
 # ---------------------------------------------------------------------------
 
 
-def _load_mdcath_trajs(data_dir, pdb_dir, name, temp, gen_replicas, truncate):
+def _load_mdcath_trajs(data_dir, pdb_dir, name, temp, gen_replicas, truncate, ca_only=False):
     """Load and split MD-CATH replicas into (ref_traj, sampler_traj).
 
     When *gen_replicas* is ``None`` the sampler trajectory is loaded from
     *pdb_dir*; otherwise the specified replica indices are used as the
     sampler set and the remaining replicas become the reference.
+
+    If *ca_only* is True both trajectories are sliced to their Cα atoms so
+    that comparisons remain fair when the sampler trajectory only contains
+    Cα coordinates.
     """
     def _load_replicas(indices):
         trajs = []
@@ -300,6 +304,12 @@ def _load_mdcath_trajs(data_dir, pdb_dir, name, temp, gen_replicas, truncate):
 
     if truncate is not None:
         sampler_traj = sampler_traj[:truncate]
+
+    if ca_only:
+        ref_ca = ref_traj.top.select("name CA")
+        ref_traj = ref_traj.atom_slice(ref_ca)
+        samp_ca = sampler_traj.top.select("name CA")
+        sampler_traj = sampler_traj.atom_slice(samp_ca)
 
     return ref_traj, sampler_traj
 
@@ -343,11 +353,11 @@ def compute_secondary_structure_fraction(traj, secondary_codes=None):
 
 def compare_gyration_radius_mdcath(
     data_dir, pdb_dir, name, temp=320, random_frames=None,
-    truncate=None, gen_replicas=None,
+    truncate=None, gen_replicas=None, ca_only=False,
 ):
     """Compare Rg distributions between MD replicas and a sampled trajectory."""
     ref_traj, sampler_traj = _load_mdcath_trajs(
-        data_dir, pdb_dir, name, temp, gen_replicas, truncate,
+        data_dir, pdb_dir, name, temp, gen_replicas, truncate, ca_only=ca_only,
     )
 
     ref_rg = compute_gyration_radius(ref_traj, random_frames=random_frames)
@@ -363,9 +373,22 @@ def compare_gyration_radius_mdcath(
 
 def compare_secondary_structure_mdcath(
     data_dir, pdb_dir, name, temp=320, random_frames=None,
-    truncate=None, gen_replicas=None,
+    truncate=None, gen_replicas=None, ca_only=False,
 ):
-    """Compare secondary-structure fraction distributions."""
+    """Compare secondary-structure fraction distributions.
+
+    Returns NaN entries when *ca_only* is True since DSSP requires the full
+    backbone (N, CA, C, O).
+    """
+    if ca_only:
+        return {
+            "ref_secondary_structure_fraction_mean": float("nan"),
+            "sampler_secondary_structure_fraction_mean": float("nan"),
+            "mean_difference": float("nan"),
+            "forward_kl_divergence": float("nan"),
+            "jensen_shannon_divergence": float("nan"),
+        }
+
     ref_traj, sampler_traj = _load_mdcath_trajs(
         data_dir, pdb_dir, name, temp, gen_replicas, truncate,
     )

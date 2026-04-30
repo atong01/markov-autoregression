@@ -10,21 +10,52 @@ import torch
 torch.serialization.add_safe_globals([argparse.Namespace])
 from tqdm import trange
 
-from markov_autoregression.data.geometry import atom14_to_frames, atom14_to_atom37, atom37_to_torsions
-from markov_autoregression.vendored.openfold.residue_constants import restype_order
+from markov_autoregression.data.geometry import (
+    atom14_to_frames,
+    atom14_to_atom37,
+    atom37_to_torsions,
+    atom14_to_backbone,
+    atom14_to_ca,
+    center_dense_coords,
+)
+from markov_autoregression.vendored.openfold.residue_constants import restype_order, atom_order
 from markov_autoregression.vendored.openfold.tensor_utils import tensor_tree_map
 from markov_autoregression.utils import atom14_to_pdb, set_seed
 from markov_autoregression.model.module import MDGenModule, MarSModule
 from markov_autoregression.model.autoregressive_model import MarSARModule
 
 
+def _is_euclidean(model):
+    return getattr(model.args, "euclidean", False)
+
+
+def _is_ca_only(model):
+    return getattr(model.args, "ca_only", False)
+
+
 def _repeat_batch(batch, n):
     return {k: v.repeat(n, *([1] * (v.ndim - 1))) for k, v in batch.items()}
 
 
-def _update_batch(batch, atom14):
+def _recenter(coords):
+    # coords: (B, L, n_atoms, 3)
+    B = coords.shape[0]
+    centroid = coords.reshape(B, -1, 3).mean(dim=1)
+    return coords - centroid.reshape(B, 1, 1, 3)
+
+
+def _update_batch(batch, atom14, *, euclidean=False):
     """Build a new batch from the last frame of a generated trajectory."""
     new_batch = {**batch}
+    if euclidean:
+        # In euclidean mode the "atom14" tensor returned by inference is
+        # actually coords of shape (B, T, L, n_atoms, 3).
+        last = _recenter(atom14[:, -1])                   # (B, L, n_atoms, 3)
+        last = last.unsqueeze(1)                          # (B, 1, L, n_atoms, 3)
+        new_batch["coords"] = last
+        new_batch["coords_plus_tau"] = last
+        return new_batch
+
     frames = atom14_to_frames(atom14[:, -1])
     new_batch["trans"] = frames._trans.unsqueeze(1)
     new_batch["rots"] = frames._rots._rot_mats.unsqueeze(1)
@@ -32,6 +63,15 @@ def _update_batch(batch, atom14):
     torsions, _ = atom37_to_torsions(atom37, batch["seqres"].cpu())
     new_batch["torsions"] = torsions.unsqueeze(1).to(atom14.device)
     return new_batch
+
+
+def _ca_coords_to_atom14(coords):
+    """Embed CA-only coords (..., 1, 3) into a full atom14 (..., 14, 3)."""
+    pad = list(coords.shape)
+    pad[-2] = 14
+    out = torch.zeros(*pad, dtype=coords.dtype, device=coords.device)
+    out[..., atom_order["CA"], :] = coords[..., 0, :]
+    return out
 
 
 def _save_trajectory(atom14_cat, seqres, out_dir, name):
@@ -43,18 +83,32 @@ def _save_trajectory(atom14_cat, seqres, out_dir, name):
     traj[0].save(pdb_path)
 
 
-def load_starting_structure(data_dir, name, seqres, mdcath=False, temp=320):
+def load_starting_structure(
+    data_dir, name, seqres, mdcath=False, temp=320,
+    euclidean=False, ca_only=False,
+):
     if mdcath:
         arr = np.load(f"{data_dir}/{name}_{temp}_0.npy")
     else:
         arr = np.lib.format.open_memmap(f"{data_dir}/{name}.npy", "r")
     arr = np.copy(arr[0:1]).astype(np.float32)
 
-    frames = atom14_to_frames(torch.from_numpy(arr))
     seqres = torch.tensor([restype_order[c] for c in seqres])
-    atom37 = torch.from_numpy(atom14_to_atom37(arr, seqres[None])).float()
     mask = torch.ones(len(seqres))
 
+    if euclidean:
+        x = torch.from_numpy(arr)                 # (1, L, 14, 3)
+        coords = atom14_to_ca(x) if ca_only else atom14_to_backbone(x)
+        coords = center_dense_coords(coords)
+        return {
+            "coords": coords,
+            "coords_plus_tau": coords,
+            "seqres": seqres,
+            "mask": mask,
+        }
+
+    frames = atom14_to_frames(torch.from_numpy(arr))
+    atom37 = torch.from_numpy(atom14_to_atom37(arr, seqres[None])).float()
     torsions, torsion_mask = atom37_to_torsions(atom37, seqres[None])
     return {
         "torsions": torsions,
@@ -68,7 +122,7 @@ def load_starting_structure(data_dir, name, seqres, mdcath=False, temp=320):
 
 def rollout_mars(model, batch, num_steps=50):
     atom14, _ = model.inference(batch, num_steps=num_steps)
-    return atom14, _update_batch(batch, atom14)
+    return atom14, _update_batch(batch, atom14, euclidean=_is_euclidean(model))
 
 
 def rollout_mdgen(model, batch, num_steps=50):
@@ -109,7 +163,8 @@ def _run_tree_mars(model, batch, args):
             permuted = expanded.permute(1, 0, *range(2, expanded.ndim))
             mega_batch[key] = permuted.reshape(N * M, *stacked.shape[1:])
 
-        n = mega_batch["torsions"].shape[0]
+        size_key = "coords" if "coords" in mega_batch else "torsions"
+        n = mega_batch[size_key].shape[0]
         next_frontier = []
         for start in range(0, n, args.tree_parallel_chunk):
             end = min(start + args.tree_parallel_chunk, n)
@@ -193,6 +248,8 @@ def generate(args):
 
         item = load_starting_structure(
             args.data_dir, name, seqres, mdcath=args.mdcath, temp=args.temp,
+            euclidean=_is_euclidean(model_mars),
+            ca_only=_is_ca_only(model_mars),
         )
         batch = next(iter(torch.utils.data.DataLoader([item])))
         batch = tensor_tree_map(lambda x: x.to(device), batch)
@@ -211,6 +268,9 @@ def generate(args):
                 _run_flat_mars_mdgen(model_mars, model_mdgen, batch, args)
             )
 
+        if _is_euclidean(model_mars) and _is_ca_only(model_mars):
+            # inference returns coords (B, T, L, 1, 3) — embed CA into atom14.
+            all_atom14 = [_ca_coords_to_atom14(t) for t in all_atom14]
         all_atom14_cat = torch.cat(
             [t.reshape(1, -1, *t.shape[2:]) for t in all_atom14], 1
         )
