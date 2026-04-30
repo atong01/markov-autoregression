@@ -26,6 +26,9 @@ def parse_train_args():
     data.add_argument("--deterministic_dataset", action="store_true",
                       help="Make __getitem__ produce the same sample for the same idx every "
                            "call by reseeding numpy RNG inside it. Use for memorization tests.")
+    data.add_argument("--enable_folding", action="store_true",
+                      help="Add a dummy 'unfolded' cluster to the MSM (requires --euclidean). "
+                           "Its conditioning frame is all-zeros; target is sampled by cluster population.")
 
     # ---- MSM / clustering ----
     msm = parser.add_argument_group("MSM clustering")

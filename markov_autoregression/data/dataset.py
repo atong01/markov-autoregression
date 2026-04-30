@@ -38,6 +38,7 @@ class MarSDatasetBase(torch.utils.data.Dataset):
         self.num_clusters_to_sample = args.clusters_per_batch
         self.euclidean = args.euclidean
         self.ca_only = args.euclidean and args.ca_only
+        self.enable_folding = args.euclidean and args.enable_folding
         self.translate = translate
         self.files = {}
 
@@ -70,10 +71,19 @@ class MarSDatasetBase(torch.utils.data.Dataset):
     def _sample_clusters(
         self, arr, clusters, probabilities, cluster_members, unique_clusters
     ):
+        dummy_cluster = probabilities.shape[0]
+
+        if self.enable_folding:
+            unique_clusters_pool = np.append(unique_clusters, dummy_cluster)
+            cluster_populations = np.array([len(m) for m in cluster_members], dtype=float)
+            pop_weights = cluster_populations / cluster_populations.sum()
+        else:
+            unique_clusters_pool = unique_clusters
+
         first_cluster = clusters[0]
         if self.num_clusters_to_sample - 1 > 0:
             remaining_clusters = np.setdiff1d(
-                unique_clusters, np.array([first_cluster])
+                unique_clusters_pool, np.array([first_cluster])
             )
             if remaining_clusters.size == 0:
                 additional_x0 = np.full(self.num_clusters_to_sample - 1, first_cluster)
@@ -87,26 +97,36 @@ class MarSDatasetBase(torch.utils.data.Dataset):
         else:
             x0_clusters = np.array([first_cluster])
 
+        is_dummy = x0_clusters == dummy_cluster
+
         x1_clusters = np.array(
             [
                 np.random.choice(
                     np.arange(probabilities.shape[0]),
                     size=self.num_samples_per_cluster,
                     replace=True,
-                    p=probabilities[x0] / probabilities[x0].sum(),
+                    p=pop_weights if (self.enable_folding and x0 == dummy_cluster)
+                      else probabilities[x0] / probabilities[x0].sum(),
                 )
                 for x0 in x0_clusters
             ]
         )
-        x0_clusters = np.repeat(x0_clusters, self.num_samples_per_cluster)
-        x1_clusters = x1_clusters.flatten()
 
-        x_t_indices = self._vectorized_sample(x0_clusters, cluster_members)
+        # Use first real cluster as placeholder for dummy x0 to get valid trajectory indices
+        x0_for_sampling = x0_clusters.copy()
+        x0_for_sampling[is_dummy] = unique_clusters[0]
+
+        x0_for_sampling = np.repeat(x0_for_sampling, self.num_samples_per_cluster)
+        x1_clusters = x1_clusters.flatten()
+        folding_mask = np.repeat(is_dummy, self.num_samples_per_cluster)
+
+        x_t_indices = self._vectorized_sample(x0_for_sampling, cluster_members)
         x_t_plus_tau_indices = self._vectorized_sample(x1_clusters, cluster_members)
 
-        return arr[x_t_indices].astype(np.float32), arr[x_t_plus_tau_indices].astype(
-            np.float32
-        )
+        x_t = arr[x_t_indices].astype(np.float32)
+        x_t[folding_mask] = 0.0
+
+        return x_t, arr[x_t_plus_tau_indices].astype(np.float32), folding_mask
 
     @staticmethod
     def _vectorized_sample(cluster_array, cluster_members):
@@ -119,7 +139,7 @@ class MarSDatasetBase(torch.utils.data.Dataset):
             ]
         return sampled
 
-    def _process_output(self, x_t, x_t_plus_tau, seqres_str, name):
+    def _process_output(self, x_t, x_t_plus_tau, seqres_str, name, folding_mask=None):
         """Convert raw atom14 arrays to (frames, torsions, and masks) or (coords and masks)"""
         seqres = np.array([restype_order[c] for c in seqres_str])
 
@@ -130,12 +150,16 @@ class MarSDatasetBase(torch.utils.data.Dataset):
             else:
                 coords = atom14_to_backbone(torch.from_numpy(x_t))
                 coords_plus_tau = atom14_to_backbone(torch.from_numpy(x_t_plus_tau))
-            
+
             coords = center_dense_coords(coords)
             coords_plus_tau = center_dense_coords(coords_plus_tau)
             if not getattr(self.args, "no_se3_augmentation", False):
                 coords, coords_plus_tau = geometric_augmentation(coords, coords_plus_tau, s_trans=self.args.s_translation, translate=self.translate)
-            
+
+            # Folding samples use all-zeros as the conditioning frame; re-zero after augmentation
+            if folding_mask is not None and folding_mask.any():
+                coords[folding_mask] = 0.0
+
             L = coords.shape[1]
             mask = np.ones(L, dtype=np.float32)
 
@@ -255,11 +279,11 @@ class MarSDataset4AA(MarSDatasetBase):
                 data = self.files[name]
 
                 arr = self._read_trajectory(data["arr_path"])
-                x_t, x_t_plus_tau = self._sample_clusters(
+                x_t, x_t_plus_tau, folding_mask = self._sample_clusters(
                     arr, data["clusters"], data["probabilities"],
                     data["cluster_members"], data["unique_clusters"],
                 )
-                return self._process_output(x_t, x_t_plus_tau, name, name)
+                return self._process_output(x_t, x_t_plus_tau, name, name, folding_mask=folding_mask)
             except (ValueError, OSError) as e:
                 if attempt == 2:
                     raise RuntimeError(f"Failed to load data after 3 attempts: {e}")
@@ -389,11 +413,11 @@ class MarSDatasetMDCath(MarSDatasetBase):
                 arr, clusters, probabilities, cluster_members, unique_clusters = (
                     self._merge_replicas(data)
                 )
-                x_t, x_t_plus_tau = self._sample_clusters(
+                x_t, x_t_plus_tau, folding_mask = self._sample_clusters(
                     arr, clusters, probabilities, cluster_members, unique_clusters
                 )
                 return self._crop_pad_output(
-                    self._process_output(x_t, x_t_plus_tau, seqres, full_name)
+                    self._process_output(x_t, x_t_plus_tau, seqres, full_name, folding_mask=folding_mask)
                 )
             except (ValueError, OSError) as e:
                 if attempt == 2:
